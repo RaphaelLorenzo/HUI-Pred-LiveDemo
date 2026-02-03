@@ -76,7 +76,7 @@ def estimate_torso_depth(keypoints: np.ndarray, scores: np.ndarray, depth_image:
 
 
 # Load model
-pose_model = YOLO("checkpoints/yolo26n-pose.pt")
+pose_model = YOLO("checkpoints/yolo26x-pose.pt")
 
 
 METADATA_CKPT_COLUMNS = ["recording", 
@@ -341,20 +341,75 @@ def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict
     return return_dict
 
 
-def process_folder(args: argparse.Namespace) -> dict:
-    """Process all images in folder with detection, tracking and pose estimation."""
+def create_frame_iterator(args: argparse.Namespace):
+    """
+    Create a frame iterator based on input type (video or folder).
+    
+    Yields:
+        Tuple of (frame_idx, PIL.Image, depth_image or None, total_frames)
+    """
+    if args.video is not None:
+        # Video input
+        video_path = os.path.expanduser(args.video)
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_idx = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Convert BGR to RGB and then to PIL Image
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(frame_rgb)
+            
+            if image.width == 3840:
+                image = image.resize((1920, 960))
+            
+            yield frame_idx, image, None, total_frames
+            frame_idx += 1
+        
+        cap.release()
+    else:
+        # Folder input
+        image_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.directory)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
+        image_paths.sort()
+        total_frames = len(image_paths)
+        
+        depth_paths = None
+        if args.depth is not None:
+            depth_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.depth)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
+            depth_paths.sort()
+            assert len(image_paths) == len(depth_paths), "Number of images and depth images must be the same"
+        
+        for frame_idx, image_path in enumerate(image_paths):
+            image = Image.open(image_path).convert("RGB")
+            if image.width == 3840:
+                image = image.resize((1920, 960))
+            
+            depth_image = None
+            if depth_paths is not None:
+                depth_image = cv2.imread(depth_paths[frame_idx], cv2.IMREAD_UNCHANGED)
+                if depth_image is None:
+                    print(f"Warning: Could not load depth image {depth_paths[frame_idx]}")
+            
+            yield frame_idx, image, depth_image, total_frames
+
+
+def process_input(args: argparse.Namespace) -> dict:
+    """Process video or folder with detection, tracking and pose estimation."""
     track_history = {}
-    image_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.directory)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
-    image_paths.sort()
-    
-    depth_paths = None
-    if args.depth is not None:
-        depth_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.depth)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
-        depth_paths.sort()
-        assert len(image_paths) == len(depth_paths), "Number of images and depth images must be the same"
-    
     
     # Load interaction prediction model
+    ip_model = None
+    ip_config = None
     if args.interaction_prediction_checkpoint is not None:
         ip_checkpoint = torch.load(args.interaction_prediction_checkpoint, map_location='cpu', weights_only=False) 
         # Make sure the checkpoint contains the model weights
@@ -384,20 +439,15 @@ def process_folder(args: argparse.Namespace) -> dict:
     info_panel = InfoPanel(
         width=600,
         history_length=100,
-        min_track_appearances=32,
+        min_track_appearances=16,
         y_max_meters=6.0,
     ) if args.display else None
-        
-    for frame_idx, image_path in enumerate(image_paths):
+    
+    # Create frame iterator
+    frame_iterator = create_frame_iterator(args)
+    
+    for frame_idx, image, depth_image, total_frames in frame_iterator:
         t_frame_start = time.perf_counter()
-        image = Image.open(image_path).convert("RGB")
-        
-        # Load depth image if provided
-        depth_image = None
-        if depth_paths is not None:
-            depth_image = cv2.imread(depth_paths[frame_idx], cv2.IMREAD_UNCHANGED)
-            if depth_image is None:
-                print(f"Warning: Could not load depth image {depth_paths[frame_idx]}")
         
         # Detection + tracking + pose with YOLO pose model
         t_infer_start = time.perf_counter()
@@ -439,7 +489,7 @@ def process_folder(args: argparse.Namespace) -> dict:
             for i, track_id in enumerate(current_track_ids):
                 track_id = int(track_id)
                 if track_id not in track_history:
-                    track_history[track_id] = {"detections": [], "poses": [], "ip_input_tensor": [], "indexes": []}
+                    track_history[track_id] = {"detections": [], "poses": [], "ip_input_tensor": [], "indexes": [], "ip_output": []}
                 
                 detection_data = {
                     "frame": frame_idx,
@@ -461,15 +511,15 @@ def process_folder(args: argparse.Namespace) -> dict:
             if args.interaction_prediction_checkpoint is not None:
                 # perform ip for current tracks
                 current_tracks_history = {int(track_id): track_history[track_id] for track_id in current_track_ids}
-                probabilities = action_net_inference(args, 
+                ip_dict = action_net_inference(args, 
                                                      ip_model, 
                                                      ip_config, 
                                                      current_tracks_history, 
                                                      device=torch.device("cuda"), 
                                                      image_size=(image.width, image.height))
-                print(probabilities)
 
-
+                for track_id, ip_output in ip_dict.items():
+                    track_history[track_id]["ip_output"].append(ip_output)
 
         # Display
         if args.display:
@@ -479,10 +529,20 @@ def process_folder(args: argparse.Namespace) -> dict:
                 x1, y1, x2, y2 = boxes[i].astype(int)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 
-                # Build label with ID and depth (if available)
+                # Build label with ID, depth (if available), and ip_output (if available)
                 label = f"ID:{track_id}"
                 if depths[i] is not None and depths[i] > 0:
                     label += f" {depths[i]:.2f}m"
+                
+                # Add ip_output to label if available
+                tid = int(track_id)
+                if tid in track_history and track_history[tid]["ip_output"]:
+                    ip_val = track_history[tid]["ip_output"][-1]  # Get latest ip_output
+                    if isinstance(ip_val, float):
+                        label += f" IP:{ip_val:.1%}"
+                    else:
+                        label += f" IP:{ip_val}"
+                
                 cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
                 keypoints = keypoints_all[i]
@@ -500,6 +560,12 @@ def process_folder(args: argparse.Namespace) -> dict:
                 
                 # Update info panel depth history
                 info_panel.update_track_depth(int(track_id), frame_idx, depths[i])
+                
+                # Update info panel IP history
+                tid = int(track_id)
+                if tid in track_history and track_history[tid]["ip_output"]:
+                    ip_val = track_history[tid]["ip_output"][-1]
+                    info_panel.update_track_ip(tid, frame_idx, ip_val)
             
             # Prune old tracks from panel history
             info_panel.prune_old_tracks(frame_idx)
@@ -519,7 +585,7 @@ def process_folder(args: argparse.Namespace) -> dict:
                 break
 
         t_frame = time.perf_counter() - t_frame_start
-        print(f"Frame {frame_idx}/{len(image_paths)} | {len(current_track_ids)} tracks | "
+        print(f"Frame {frame_idx}/{total_frames} | {len(current_track_ids)} tracks | "
               f"infer: {t_infer*1000:.1f}ms, total: {t_frame*1000:.1f}ms")
 
     if args.display:
@@ -529,15 +595,17 @@ def process_folder(args: argparse.Namespace) -> dict:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--directory", "-d", type=str, help="Path to folder containing images")
-    parser.add_argument("--depth", type=str, default=None, help="Path to folder containing depth images (optional)")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--directory", "-d", type=str, help="Path to folder containing images")
+    input_group.add_argument("--video", "-v", type=str, help="Path to video file")
+    parser.add_argument("--depth", type=str, default=None, help="Path to folder containing depth images (optional, only for directory input)")
     parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default=None, help="Path to interaction prediction checkpoint (optional)")
     parser.add_argument("--depth_scale", type=float, default=1000.0, help="Depth scale factor (depth units per meter, e.g., 1000 for mm)")
     parser.add_argument("--display", action="store_true", default=False, help="Display results with cv2")
     parser.add_argument("--kp_thresh", type=float, default=0.3, help="Keypoint confidence threshold")
     args = parser.parse_args()
     
-    history = process_folder(args)
+    history = process_input(args)
     print(f"Processed {len(history)} unique tracks")
     for track_id, data in history.items():
         print(f"  Track {track_id}: {len(data['detections'])} frames")

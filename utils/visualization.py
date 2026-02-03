@@ -39,6 +39,9 @@ class InfoPanel:
         # Track depth history: {track_id: deque of (frame_idx, depth_meters)}
         self.depth_history: Dict[int, deque] = {}
         
+        # Track IP output history: {track_id: deque of (frame_idx, ip_value)}
+        self.ip_history: Dict[int, deque] = {}
+        
         # Graph layout
         self.graph_margin = 40
         self.graph_top = 100  # Space for text info above graph
@@ -51,8 +54,22 @@ class InfoPanel:
         if depth_meters is not None and depth_meters > 0:
             self.depth_history[track_id].append((frame_idx, depth_meters))
     
+    def update_track_ip(self, track_id: int, frame_idx: int, ip_value):
+        """Update the IP output history for a track. Invalid values are mapped to 0."""
+        if track_id not in self.ip_history:
+            self.ip_history[track_id] = deque(maxlen=self.history_length)
+        
+        # Map invalid values (non-float) to 0
+        if isinstance(ip_value, (int, float)):
+            val = float(ip_value)
+        else:
+            val = 0.0
+        
+        self.ip_history[track_id].append((frame_idx, val))
+    
     def prune_old_tracks(self, current_frame: int):
         """Remove tracks that haven't been seen recently."""
+        # Prune depth history
         tracks_to_remove = []
         for track_id, history in self.depth_history.items():
             if len(history) == 0:
@@ -65,6 +82,19 @@ class InfoPanel:
         
         for track_id in tracks_to_remove:
             del self.depth_history[track_id]
+        
+        # Prune IP history
+        tracks_to_remove = []
+        for track_id, history in self.ip_history.items():
+            if len(history) == 0:
+                tracks_to_remove.append(track_id)
+                continue
+            last_frame = history[-1][0]
+            if current_frame - last_frame > self.history_length:
+                tracks_to_remove.append(track_id)
+        
+        for track_id in tracks_to_remove:
+            del self.ip_history[track_id]
     
     def draw(
         self,
@@ -103,12 +133,20 @@ class InfoPanel:
         cv2.putText(panel, f"Latency: {latency_ms:.1f} ms", (10, y_text), font, font_scale, text_color, 1)
         y_text += line_height + 10
         
-        # Draw depth graph
-        self._draw_depth_graph(panel, frame_idx, y_text)
+        # Calculate space for two graphs
+        available_height = frame_height - y_text - self.graph_margin
+        graph_height_each = (available_height - 30) // 2  # 30px gap between graphs
+        
+        # Draw depth graph (top)
+        self._draw_depth_graph(panel, frame_idx, y_text, graph_height_each)
+        
+        # Draw IP output graph (bottom)
+        ip_graph_start = y_text + graph_height_each + 50  # 50px gap for title and spacing
+        self._draw_ip_graph(panel, frame_idx, ip_graph_start, graph_height_each)
         
         return panel
     
-    def _draw_depth_graph(self, panel: np.ndarray, current_frame: int, y_start: int):
+    def _draw_depth_graph(self, panel: np.ndarray, current_frame: int, y_start: int, max_height: int = None):
         """Draw the depth over time graph."""
         h, w = panel.shape[:2]
         margin = self.graph_margin
@@ -117,7 +155,10 @@ class InfoPanel:
         graph_left = margin
         graph_right = w - margin // 2
         graph_top = y_start + 20
-        graph_bottom = h - margin
+        if max_height is not None:
+            graph_bottom = y_start + max_height
+        else:
+            graph_bottom = h - margin
         graph_width = graph_right - graph_left
         graph_height = graph_bottom - graph_top
         
@@ -169,6 +210,100 @@ class InfoPanel:
                 
                 # Draw point
                 cv2.circle(panel, (px, py), 3, color, -1)
+    
+    def _draw_ip_graph(self, panel: np.ndarray, current_frame: int, y_start: int, max_height: int = None):
+        """Draw the IP output over time graph (0 to 1 scale)."""
+        h, w = panel.shape[:2]
+        margin = self.graph_margin
+        
+        # Graph area
+        graph_left = margin
+        graph_right = w - margin // 2
+        graph_top = y_start + 20
+        if max_height is not None:
+            graph_bottom = y_start + max_height
+        else:
+            graph_bottom = h - margin
+        graph_width = graph_right - graph_left
+        graph_height = graph_bottom - graph_top
+        
+        if graph_height < 50 or graph_width < 50:
+            return  # Not enough space
+        
+        # Draw title
+        cv2.putText(panel, "IP Output vs Time", (margin, y_start + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+        
+        # Draw graph background
+        cv2.rectangle(panel, (graph_left, graph_top), (graph_right, graph_bottom), (50, 50, 50), -1)
+        cv2.rectangle(panel, (graph_left, graph_top), (graph_right, graph_bottom), (100, 100, 100), 1)
+        
+        # X-axis: sliding window of last history_length frames
+        x_min = max(0, current_frame - self.history_length + 1)
+        x_max = current_frame
+        
+        # Y-axis: 0 to 1 for IP output
+        y_min = 0.0
+        y_max = 1.0
+        
+        # Draw grid lines and labels (custom for 0-1 range)
+        self._draw_ip_grid(panel, graph_left, graph_right, graph_top, graph_bottom,
+                           x_min, x_max, y_min, y_max)
+        
+        # Find tracks with enough appearances
+        eligible_tracks = []
+        for track_id, history in self.ip_history.items():
+            # Count appearances in the current window
+            appearances = sum(1 for f, v in history if x_min <= f <= x_max)
+            if appearances >= self.min_track_appearances:
+                eligible_tracks.append(track_id)
+        
+        # Plot each eligible track
+        for track_id in eligible_tracks:
+            color = get_track_color(track_id)
+            history = self.ip_history[track_id]
+            
+            for frame, ip_val in history:
+                if frame < x_min or frame > x_max:
+                    continue
+                # Clamp ip_val to [0, 1]
+                ip_val = max(0.0, min(1.0, ip_val))
+                
+                # Convert to pixel coordinates
+                px = int(graph_left + (frame - x_min) / max(1, x_max - x_min) * graph_width)
+                py = int(graph_bottom - (ip_val - y_min) / (y_max - y_min) * graph_height)
+                
+                # Draw point
+                cv2.circle(panel, (px, py), 3, color, -1)
+    
+    def _draw_ip_grid(
+        self,
+        panel: np.ndarray,
+        left: int, right: int, top: int, bottom: int,
+        x_min: int, x_max: int, y_min: float, y_max: float
+    ):
+        """Draw grid lines and axis labels for IP graph (0-1 range)."""
+        grid_color = (70, 70, 70)
+        label_color = (150, 150, 150)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.35
+        
+        # Y-axis grid lines (IP output 0-1)
+        y_ticks = [0.0, 0.25, 0.5, 0.75, 1.0]
+        for y_val in y_ticks:
+            py = int(bottom - (y_val - y_min) / (y_max - y_min) * (bottom - top))
+            cv2.line(panel, (left, py), (right, py), grid_color, 1)
+            cv2.putText(panel, f"{y_val:.2f}", (2, py + 4), font, font_scale, label_color, 1)
+        
+        # X-axis: show a few frame markers
+        width = right - left
+        num_x_ticks = 5
+        for i in range(num_x_ticks + 1):
+            x_val = x_min + (x_max - x_min) * i / num_x_ticks
+            px = int(left + width * i / num_x_ticks)
+            cv2.line(panel, (px, top), (px, bottom), grid_color, 1)
+            if i % 2 == 0:  # Label every other tick
+                cv2.putText(panel, f"{int(x_val)}", (px - 10, bottom + 12), font, font_scale, label_color, 1)
     
     def _draw_grid(
         self,
