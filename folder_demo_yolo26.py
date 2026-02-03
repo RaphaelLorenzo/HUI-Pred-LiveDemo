@@ -1,13 +1,23 @@
 import argparse
+import os
 import time
 import cv2
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from ultralytics import YOLO
-import os
-
+import torch
+import torch.nn as nn
 from utils.visualization import InfoPanel, get_track_color, concatenate_with_panel
+from functools import partial
+
+from predictors.mlp import MLPInteractionPredictor
+from predictors.lstm import LSTMInteractionPredictor
+from predictors.MotionBERT.lib.model.DSTformer import DSTformer
+from predictors.MotionBERT.lib.model.model_action import ActionNet
+from predictors.STG_NF.model_pose import STG_NF
+from predictors.STGCN.net.st_gcn import Model as STGCN
+from predictors.SkateFormer.model.SkateFormer import SkateFormer
 
 # COCO pose skeleton connections (17 keypoints format)
 COCO_SKELETON = [
@@ -69,6 +79,268 @@ def estimate_torso_depth(keypoints: np.ndarray, scores: np.ndarray, depth_image:
 pose_model = YOLO("checkpoints/yolo26n-pose.pt")
 
 
+METADATA_CKPT_COLUMNS = ["recording", 
+                    "episode", 
+                    "image_height", 
+                    "image_width", 
+                    "unique_track_identifier", 
+                    "track_id", 
+                    "image_file", 
+                    "image_index", 
+                    "validity", 
+                    "current_segment", 
+                    "total_segments", 
+                    "position_in_segment", 
+                    "length_of_current_segment", 
+                    "timestamp", 
+                    "timestamp_sec", 
+                    "timestamp_track", 
+                    "engagement", 
+                    "time_to_first_interaction", 
+                    "mask_rle"
+                    ]
+
+def load_model_from_config(config: dict, device: torch.device) -> torch.nn.Module:
+    
+    include_columns = config["include_columns"]
+    data_columns = [col for col in include_columns if col not in METADATA_CKPT_COLUMNS]
+    input_dim = len(data_columns)
+    
+    print(f"Input dimension: {input_dim} | Data columns: {data_columns}")
+
+    if "select_input_range" in config and config["select_input_range"] != [[0,-1]]:
+        sequence_length = config["select_input_range"][1] - config["select_input_range"][0]
+    else:
+        sequence_length = config["input_length_in_frames"] // config["subsample_frames"]
+    
+    assert(config["subsample_frames"] == 1), "Subsampling frames is not supported for live interaction prediction"
+    
+    # Instantiate model
+    if config["force_model_type"] == "mlp":
+        model = MLPInteractionPredictor(
+            input_dim=input_dim,
+            sequence_length=sequence_length,
+            hidden_dims=config["hidden_dims"],
+            dropout=config["dropout"]
+        ).to(device)
+        
+    elif config["force_model_type"] == "lstm":
+        model = LSTMInteractionPredictor(
+            input_dim=input_dim,
+            sequence_length=sequence_length,
+            hidden_dim=config["lstm_hidden_dim"],
+            num_layers=config["lstm_num_layers"],
+            dropout=config["lstm_dropout"],
+            bidirectional=False
+        ).to(device)
+        
+    elif config["force_model_type"].lower().startswith("motionbert") or config["force_model_type"].lower().startswith("mb"):
+        # Default parameters from pretrain/MB_pretrain.yaml
+        backbone = DSTformer(
+            dim_in=3, 
+            dim_out=3, # for the 3D reconstruction, but we will not use it if we return the representation
+            dim_feat=256 if "_lite" in config["force_model_type"].lower() else 512, 
+            dim_rep=512, 
+            depth=5, 
+            num_heads=8, 
+            mlp_ratio=4 if "_lite" in config["force_model_type"].lower() else 2, 
+            norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+            maxlen=243, 
+            num_joints=17,
+            desired_return="representation"
+        )
+        
+        # Will directly load the full weights from the checkpoint don't care if pretrained, finetuned or not
+
+        model = ActionNet(backbone=backbone, 
+                          dim_rep=512, 
+                          num_classes=1, 
+                          dropout_ratio=config["mb_head_dropout"], 
+                          version='class', 
+                          hidden_dim=config["mb_head_hidden_dim"], 
+                          num_joints=17).to(device)
+
+    elif config["force_model_type"] == "stg_nf":
+        model = STG_NF(device=device,
+                        pose_shape=(2, sequence_length, 18),
+                        hidden_channels=config["stg_nf_hidden_channels"],
+                        K=config["stg_nf_K"],
+                        L=config["stg_nf_L"],
+                        R=config["stg_nf_R"],
+                        actnorm_scale=config["stg_nf_actnorm_scale"],
+                        flow_permutation="permute",
+                        flow_coupling="affine",
+                        LU_decomposed=True,
+                        learn_top=False,
+                        edge_importance=config["stg_nf_edge_importance"],
+                        temporal_kernel_size=None,
+                        strategy="uniform",
+                        max_hops=config["stg_nf_max_hops"],).to(device)
+
+    elif config["force_model_type"] == "stgcn":
+        model = STGCN(
+            in_channels=config["stgcn_in_channels"],
+            num_class=1,
+            graph_args={"layout": config["stgcn_layout"], "strategy": 'spatial'},
+            edge_importance_weighting=config["stgcn_edge_importance_weighting"],
+        ).to(device)
+        
+    elif config["force_model_type"] == "skateformer":
+        assert(sequence_length % 8 == 0), "Sequence length must be divisible by 8 for SkateFormer"
+        Tdim = sequence_length // 8
+        ncolumns_input = len(config["include_columns"]) 
+        # 74 = D3 (ViTPose) will be mapped to NW-UCLA (20 joints) (in this case at loading, D=56)
+        # 263 = D8 (ViTPose + Sapiens) will be mapped to NTU without spine (24 joints) (in this case at loading, D=245)
+        # 212 = D9 (Sapiens) will be mapped to NTU without spine (24 joints) (in this case at loading, D=194)
+        if ncolumns_input == 74:
+            num_joints_mapped = 20
+            types_spatial_sizes = [(Tdim, 4), (Tdim, 5), (Tdim, 4), (Tdim, 5)]
+        elif ncolumns_input == 263 or ncolumns_input == 212:
+            num_joints_mapped = 24
+            types_spatial_sizes = [(Tdim, 8), (Tdim, 12), (Tdim, 8), (Tdim, 12)]
+        else:
+            raise ValueError(f"Invalid number of input columns: {ncolumns_input} (expect 74, 263 or 212 i.e. D3, D8 or D9)")
+
+        model = SkateFormer(
+            in_channels=config["skateformer_in_channels"],
+            depths=(2, 2, 2, 2),
+            channels=(96, 192, 192, 192),
+            num_classes=1,
+            embed_dim=96,
+            num_people=1,
+            num_points=num_joints_mapped,
+            kernel_size=7,
+            num_heads=32,
+            attn_drop=0.5,
+            head_drop=0.0,
+            rel=True,
+            drop_path=0.2,
+            type_1_size=types_spatial_sizes[0],
+            type_2_size=types_spatial_sizes[1],
+            type_3_size=types_spatial_sizes[2],
+            type_4_size=types_spatial_sizes[3],
+            mlp_ratio=1.0,
+            index_t=True,
+        ).to(device)
+        
+    else:
+        raise ValueError(f"Invalid model type: {config['force_model_type']}")
+
+    model.eval()
+    return model
+
+
+def coco2h36m(x):
+    '''
+        Input: x (M x T x V x C) or (B, T, V, C)
+        
+        COCO: {0-nose 1-Leye 2-Reye 3-Lear 4Rear 5-Lsho 6-Rsho 7-Lelb 8-Relb 9-Lwri 10-Rwri 11-Lhip 12-Rhip 13-Lkne 14-Rkne 15-Lank 16-Rank}
+        
+        H36M:
+        0: 'root',
+        1: 'rhip',
+        2: 'rkne',
+        3: 'rank',
+        4: 'lhip',
+        5: 'lkne',
+        6: 'lank',
+        7: 'belly',
+        8: 'neck',
+        9: 'nose',
+        10: 'head',
+        11: 'lsho',
+        12: 'lelb',
+        13: 'lwri',
+        14: 'rsho',
+        15: 'relb',
+        16: 'rwri'
+    '''
+    y = torch.zeros(x.shape, device=x.device)
+    y[:,:,0,:] = (x[:,:,11,:] + x[:,:,12,:]) * 0.5
+    y[:,:,1,:] = x[:,:,12,:]
+    y[:,:,2,:] = x[:,:,14,:]
+    y[:,:,3,:] = x[:,:,16,:]
+    y[:,:,4,:] = x[:,:,11,:]
+    y[:,:,5,:] = x[:,:,13,:]
+    y[:,:,6,:] = x[:,:,15,:]
+    y[:,:,8,:] = (x[:,:,5,:] + x[:,:,6,:]) * 0.5
+    y[:,:,7,:] = (y[:,:,0,:] + y[:,:,8,:]) * 0.5
+    y[:,:,9,:] = x[:,:,0,:]
+    y[:,:,10,:] = (x[:,:,1,:] + x[:,:,2,:]) * 0.5
+    y[:,:,11,:] = x[:,:,5,:]
+    y[:,:,12,:] = x[:,:,7,:]
+    y[:,:,13,:] = x[:,:,9,:]
+    y[:,:,14,:] = x[:,:,6,:]
+    y[:,:,15,:] = x[:,:,8,:]
+    y[:,:,16,:] = x[:,:,10,:]
+    return y
+    
+
+def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict, current_tracks_history: dict, device: torch.device, image_size: tuple) -> np.ndarray:
+    """
+    Perform inference on the ActionNet model.
+    """
+    
+    assert(config["mb_input_norm"] == "vid"), "Only video normalization is supported for live interaction prediction"
+    
+    min_valid_keypoints = config["min_keypoints_filter"]
+    input_length_in_frames = config["input_length_in_frames"]
+    max_index_gap_allowed = 2
+    w,h = image_size
+    whtensor = torch.tensor([w, h], device=device)
+    
+    # print(current_tracks_history.keys())
+    return_dict = {track_id: "NC" for track_id in current_tracks_history.keys()}
+    valid_ids = []
+    valid_input_tensors = []
+    
+    for track_id, track_history in current_tracks_history.items():
+        indexes = track_history["indexes"]
+        input_tensors = track_history["ip_input_tensor"]
+        if len(indexes) < input_length_in_frames:
+            return_dict[track_id] = "not_enough_frames"
+            continue
+        
+        last_indexes = np.array(indexes[-input_length_in_frames:]) # T
+        last_indexes_gap = np.diff(last_indexes) # T-1
+        if np.any(last_indexes_gap > max_index_gap_allowed):
+            return_dict[track_id] = "index_gap_too_large"
+            continue
+        
+        last_input_tensors = input_tensors[-input_length_in_frames:]
+        last_input_tensors = torch.stack(last_input_tensors, dim=0) # T, 17, 3
+        last_input_scores = last_input_tensors[:, :, 2] # T, 17
+        last_input_valid_joints = (last_input_scores > args.kp_thresh).sum(dim=1) # T
+        if torch.any(last_input_valid_joints < min_valid_keypoints):
+            return_dict[track_id] = "not_enough_valid_joints"
+            continue
+        else:
+            valid_ids.append(track_id)
+            valid_input_tensors.append(last_input_tensors)
+
+    if len(valid_ids) == 0:
+        return return_dict
+    
+    valid_input_tensors = torch.stack(valid_input_tensors, dim=0) # B, T, 17, 3
+    valid_input_tensors = coco2h36m(valid_input_tensors)
+    scale = min(w,h) / 2.0
+    valid_input_tensors[...,:2] = valid_input_tensors[...,:2] - whtensor / 2.0
+    valid_input_tensors[...,:2] = valid_input_tensors[...,:2] / scale
+    valid_input_tensors = valid_input_tensors.unsqueeze(1) # B, M, T, 17, 3
+    valid_input_tensors.to(device)
+
+    with torch.no_grad():
+        model_output = model(valid_input_tensors) # B, M, 1
+        probabilities = torch.sigmoid(model_output.squeeze())
+        if probabilities.ndim == 0:
+            probabilities = probabilities.unsqueeze(0) # torch.tensor of shape (1,)
+        
+        for i, track_id in enumerate(valid_ids):
+            return_dict[track_id] = probabilities[i].item()
+            
+    return return_dict
+
+
 def process_folder(args: argparse.Namespace) -> dict:
     """Process all images in folder with detection, tracking and pose estimation."""
     track_history = {}
@@ -81,11 +353,38 @@ def process_folder(args: argparse.Namespace) -> dict:
         depth_paths.sort()
         assert len(image_paths) == len(depth_paths), "Number of images and depth images must be the same"
     
+    
+    # Load interaction prediction model
+    if args.interaction_prediction_checkpoint is not None:
+        ip_checkpoint = torch.load(args.interaction_prediction_checkpoint, map_location='cpu', weights_only=False) 
+        # Make sure the checkpoint contains the model weights
+        if 'model_state_dict' not in ip_checkpoint:
+            raise ValueError("Checkpoint does not contain 'model_state_dict' key. Cannot load model weights.")
+        
+        # Extract config and handle backward compatibility
+        if 'config' not in ip_checkpoint:
+            if 'hyperparameters' in ip_checkpoint:
+                ip_checkpoint["config"] = ip_checkpoint["hyperparameters"]
+            raise ValueError("Checkpoint does not contain 'config' or 'hyperparameters' key. Cannot recreate dataloader.")
+
+        ip_config = ip_checkpoint['config']
+        print(f"Model type: {ip_config['force_model_type']} | cross evaluation type: {ip_config['cross_eval_type']}")
+        print(f"AUC {ip_checkpoint['val_auc']:.4f} | AP {ip_checkpoint['val_ap']:.4f}")
+        
+        print(ip_config.keys())
+        
+        ip_model = load_model_from_config(ip_config, device="cuda")
+        ip_model.load_state_dict(ip_checkpoint['model_state_dict'], strict=True)
+        if type(ip_model) != ActionNet:
+            raise NotImplementedError(f"Model type {type(ip_model).__name__} not supported for live interaction prediction for now")
+        
+        print(f"Loaded model of type {type(ip_model).__name__} and weights from checkpoint")    
+    
     # Initialize info panel for display
     info_panel = InfoPanel(
         width=600,
         history_length=100,
-        min_track_appearances=30,
+        min_track_appearances=32,
         y_max_meters=6.0,
     ) if args.display else None
         
@@ -107,23 +406,26 @@ def process_folder(args: argparse.Namespace) -> dict:
         
         # Skip frame if no detections
         if results.boxes.id is None:
-            track_ids = []
+            current_track_ids = []
             boxes = []
             confs = []
             keypoints_all = []
             scores_all = []
             depths = []
         else:
-            track_ids = results.boxes.id.int().cpu().numpy()
+            current_track_ids = results.boxes.id.int().cpu().numpy()
             boxes = results.boxes.xyxy.cpu().numpy()
             confs = results.boxes.conf.cpu().numpy()
-            keypoints_all = results.keypoints.xy.cpu().numpy()
-            scores_all = results.keypoints.conf.cpu().numpy()
+            keypoints_all = results.keypoints.xy #.cpu().numpy() # B,17,2
+            scores_all = results.keypoints.conf #.cpu().numpy() # B,17
+            ip_input_tensor = torch.cat([keypoints_all, scores_all.unsqueeze(-1)], dim=2).clone() # B,17,3                        
+            keypoints_all = keypoints_all.cpu().numpy()
+            scores_all = scores_all.cpu().numpy()
             
             # Compute depth for each person if depth image is available
             depths = []
             if depth_image is not None:
-                for i in range(len(track_ids)):
+                for i in range(len(current_track_ids)):
                     depth_raw = estimate_torso_depth(
                         keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
                     )
@@ -131,13 +433,13 @@ def process_folder(args: argparse.Namespace) -> dict:
                     depth_meters = depth_raw / args.depth_scale if depth_raw > 0 else None
                     depths.append(depth_meters)
             else:
-                depths = [None] * len(track_ids)
+                depths = [None] * len(current_track_ids)
             
             # Update track history
-            for i, track_id in enumerate(track_ids):
+            for i, track_id in enumerate(current_track_ids):
                 track_id = int(track_id)
                 if track_id not in track_history:
-                    track_history[track_id] = {"detections": [], "poses": []}
+                    track_history[track_id] = {"detections": [], "poses": [], "ip_input_tensor": [], "indexes": []}
                 
                 detection_data = {
                     "frame": frame_idx,
@@ -153,11 +455,26 @@ def process_folder(args: argparse.Namespace) -> dict:
                     "keypoints": keypoints_all[i].tolist(),
                     "scores": scores_all[i].tolist(),
                 })
+                track_history[track_id]["ip_input_tensor"].append(ip_input_tensor[i])
+                track_history[track_id]["indexes"].append(frame_idx)
+            
+            if args.interaction_prediction_checkpoint is not None:
+                # perform ip for current tracks
+                current_tracks_history = {int(track_id): track_history[track_id] for track_id in current_track_ids}
+                probabilities = action_net_inference(args, 
+                                                     ip_model, 
+                                                     ip_config, 
+                                                     current_tracks_history, 
+                                                     device=torch.device("cuda"), 
+                                                     image_size=(image.width, image.height))
+                print(probabilities)
+
+
 
         # Display
         if args.display:
             frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            for i, track_id in enumerate(track_ids):
+            for i, track_id in enumerate(current_track_ids):
                 color = get_track_color(int(track_id))
                 x1, y1, x2, y2 = boxes[i].astype(int)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -192,7 +509,7 @@ def process_folder(args: argparse.Namespace) -> dict:
             panel = info_panel.draw(
                 frame_height=frame.shape[0],
                 frame_idx=frame_idx,
-                num_tracks=len(track_ids),
+                num_tracks=len(current_track_ids),
                 latency_ms=t_frame * 1000,
             )
             display_frame = concatenate_with_panel(frame, panel)
@@ -202,7 +519,7 @@ def process_folder(args: argparse.Namespace) -> dict:
                 break
 
         t_frame = time.perf_counter() - t_frame_start
-        print(f"Frame {frame_idx}/{len(image_paths)} | {len(track_ids)} tracks | "
+        print(f"Frame {frame_idx}/{len(image_paths)} | {len(current_track_ids)} tracks | "
               f"infer: {t_infer*1000:.1f}ms, total: {t_frame*1000:.1f}ms")
 
     if args.display:
@@ -214,6 +531,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", "-d", type=str, help="Path to folder containing images")
     parser.add_argument("--depth", type=str, default=None, help="Path to folder containing depth images (optional)")
+    parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default=None, help="Path to interaction prediction checkpoint (optional)")
     parser.add_argument("--depth_scale", type=float, default=1000.0, help="Depth scale factor (depth units per meter, e.g., 1000 for mm)")
     parser.add_argument("--display", action="store_true", default=False, help="Display results with cv2")
     parser.add_argument("--kp_thresh", type=float, default=0.3, help="Keypoint confidence threshold")

@@ -19,7 +19,7 @@ class InfoPanel:
         self,
         width: int = 300,
         history_length: int = 100,
-        min_track_appearances: int = 30,
+        min_track_appearances: int = 32,
         y_max_meters: float = 6.0,
     ):
         """
