@@ -11,5 +11,6 @@ joblib
 torchvision
 timm
 einops
-ultralytics==8.3.133
+ultralytics
 transformers
+accelerate
