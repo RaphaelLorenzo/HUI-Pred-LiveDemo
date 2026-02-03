@@ -7,19 +7,14 @@ from PIL import Image
 from ultralytics import YOLO
 import os
 
+from utils.visualization import InfoPanel, get_track_color, concatenate_with_panel
+
 # COCO pose skeleton connections (17 keypoints format)
 COCO_SKELETON = [
     [15, 13], [13, 11], [16, 14], [14, 12], [11, 12], 
     [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9], 
     [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6]
 ]
-
-
-def get_track_color(track_id: int) -> tuple:
-    """Generate a consistent color for a track ID using golden ratio."""
-    hue = (track_id * 0.618033988749895) % 1.0
-    rgb = cv2.cvtColor(np.array([[[int(hue * 180), 255, 255]]], dtype=np.uint8), cv2.COLOR_HSV2BGR)[0, 0]
-    return int(rgb[0]), int(rgb[1]), int(rgb[2])
 
 
 def estimate_torso_depth(keypoints: np.ndarray, scores: np.ndarray, depth_image: np.ndarray, kp_thresh: float) -> float | None:
@@ -65,7 +60,7 @@ def estimate_torso_depth(keypoints: np.ndarray, scores: np.ndarray, depth_image:
                 depth_samples.append(depth_image[y, x])
     
     if len(depth_samples) == 0:
-        return -1000.0
+        return -1.0  # Sentinel value for no valid samples
     
     return float(np.median(depth_samples))
 
@@ -85,6 +80,14 @@ def process_folder(args: argparse.Namespace) -> dict:
         depth_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.depth)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
         depth_paths.sort()
         assert len(image_paths) == len(depth_paths), "Number of images and depth images must be the same"
+    
+    # Initialize info panel for display
+    info_panel = InfoPanel(
+        width=600,
+        history_length=100,
+        min_track_appearances=30,
+        y_max_meters=6.0,
+    ) if args.display else None
         
     for frame_idx, image_path in enumerate(image_paths):
         t_frame_start = time.perf_counter()
@@ -104,45 +107,52 @@ def process_folder(args: argparse.Namespace) -> dict:
         
         # Skip frame if no detections
         if results.boxes.id is None:
-            continue
-        
-        track_ids = results.boxes.id.int().cpu().numpy()
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        keypoints_all = results.keypoints.xy.cpu().numpy()
-        scores_all = results.keypoints.conf.cpu().numpy()
-        
-        # Compute depth for each person if depth image is available
-        depths = []
-        if depth_image is not None:
-            for i in range(len(track_ids)):
-                depth_val = estimate_torso_depth(
-                    keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
-                ) / 1000.0 # in m
-                depths.append(depth_val)
+            track_ids = []
+            boxes = []
+            confs = []
+            keypoints_all = []
+            scores_all = []
+            depths = []
         else:
-            depths = [None] * len(track_ids)
-        
-        # Update track history
-        for i, track_id in enumerate(track_ids):
-            track_id = int(track_id)
-            if track_id not in track_history:
-                track_history[track_id] = {"detections": [], "poses": []}
+            track_ids = results.boxes.id.int().cpu().numpy()
+            boxes = results.boxes.xyxy.cpu().numpy()
+            confs = results.boxes.conf.cpu().numpy()
+            keypoints_all = results.keypoints.xy.cpu().numpy()
+            scores_all = results.keypoints.conf.cpu().numpy()
             
-            detection_data = {
-                "frame": frame_idx,
-                "bbox": boxes[i].tolist(),
-                "conf": float(confs[i]),
-            }
-            if depths[i] is not None:
-                detection_data["depth"] = depths[i]
+            # Compute depth for each person if depth image is available
+            depths = []
+            if depth_image is not None:
+                for i in range(len(track_ids)):
+                    depth_raw = estimate_torso_depth(
+                        keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
+                    )
+                    # Convert to meters using depth_scale (e.g., 1000 for mm depth images)
+                    depth_meters = depth_raw / args.depth_scale if depth_raw > 0 else None
+                    depths.append(depth_meters)
+            else:
+                depths = [None] * len(track_ids)
             
-            track_history[track_id]["detections"].append(detection_data)
-            track_history[track_id]["poses"].append({
-                "frame": frame_idx,
-                "keypoints": keypoints_all[i].tolist(),
-                "scores": scores_all[i].tolist(),
-            })
+            # Update track history
+            for i, track_id in enumerate(track_ids):
+                track_id = int(track_id)
+                if track_id not in track_history:
+                    track_history[track_id] = {"detections": [], "poses": []}
+                
+                detection_data = {
+                    "frame": frame_idx,
+                    "bbox": boxes[i].tolist(),
+                    "conf": float(confs[i]),
+                }
+                if depths[i] is not None:
+                    detection_data["depth"] = depths[i]
+                
+                track_history[track_id]["detections"].append(detection_data)
+                track_history[track_id]["poses"].append({
+                    "frame": frame_idx,
+                    "keypoints": keypoints_all[i].tolist(),
+                    "scores": scores_all[i].tolist(),
+                })
 
         # Display
         if args.display:
@@ -154,8 +164,8 @@ def process_folder(args: argparse.Namespace) -> dict:
                 
                 # Build label with ID and depth (if available)
                 label = f"ID:{track_id}"
-                if depths[i] is not None:
-                    label += f" D:{depths[i]:.1f}"
+                if depths[i] is not None and depths[i] > 0:
+                    label += f" {depths[i]:.2f}m"
                 cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
                 keypoints = keypoints_all[i]
@@ -170,7 +180,24 @@ def process_folder(args: argparse.Namespace) -> dict:
                 for kp, score in zip(keypoints, scores):
                     if score > args.kp_thresh:
                         cv2.circle(frame, (int(kp[0]), int(kp[1])), 4, color, -1)
-            cv2.imshow("Pose", frame)
+                
+                # Update info panel depth history
+                info_panel.update_track_depth(int(track_id), frame_idx, depths[i])
+            
+            # Prune old tracks from panel history
+            info_panel.prune_old_tracks(frame_idx)
+            
+            # Draw info panel and concatenate
+            t_frame = time.perf_counter() - t_frame_start
+            panel = info_panel.draw(
+                frame_height=frame.shape[0],
+                frame_idx=frame_idx,
+                num_tracks=len(track_ids),
+                latency_ms=t_frame * 1000,
+            )
+            display_frame = concatenate_with_panel(frame, panel)
+            
+            cv2.imshow("Pose", display_frame)
             if cv2.waitKey(1) == ord("q"):
                 break
 
@@ -187,6 +214,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", "-d", type=str, help="Path to folder containing images")
     parser.add_argument("--depth", type=str, default=None, help="Path to folder containing depth images (optional)")
+    parser.add_argument("--depth_scale", type=float, default=1000.0, help="Depth scale factor (depth units per meter, e.g., 1000 for mm)")
     parser.add_argument("--display", action="store_true", default=False, help="Display results with cv2")
     parser.add_argument("--kp_thresh", type=float, default=0.3, help="Keypoint confidence threshold")
     args = parser.parse_args()

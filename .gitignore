@@ -2,3 +2,4 @@
 *.pt
 *.pth
 checkpoints
+__pycache__
