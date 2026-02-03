@@ -143,12 +143,12 @@ def process_folder(folder_path: str, display: bool = False, kp_thresh: float = 0
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("folder", type=str, help="Path to folder containing images")
+    parser.add_argument("--directory", "-d", type=str, help="Path to folder containing images")
     parser.add_argument("--display", action="store_true", default=False, help="Display results with cv2")
     parser.add_argument("--kp_thresh", type=float, default=0.3, help="Keypoint confidence threshold")
     args = parser.parse_args()
     
-    history = process_folder(args.folder, display=args.display, kp_thresh=args.kp_thresh)
+    history = process_folder(args.directory, display=args.display, kp_thresh=args.kp_thresh)
     print(f"Processed {len(history)} unique tracks")
     for track_id, data in history.items():
         print(f"  Track {track_id}: {len(data['detections'])} frames")
