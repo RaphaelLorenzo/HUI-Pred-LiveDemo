@@ -9,6 +9,7 @@ from ultralytics import YOLO
 import torch
 import torch.nn as nn
 from utils.visualization import InfoPanel, get_track_color, concatenate_with_panel
+from utils.geometry_utils import rot_matrix_torch
 from functools import partial
 
 from predictors.mlp import MLPInteractionPredictor
@@ -274,20 +275,104 @@ def coco2h36m(x):
     y[:,:,15,:] = x[:,:,8,:]
     y[:,:,16,:] = x[:,:,10,:]
     return y
-    
 
-def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict, current_tracks_history: dict, device: torch.device, image_size: tuple) -> np.ndarray:
+
+def backproject_points_to_equirect(
+    points: torch.Tensor,
+    persp_size: tuple,
+    eq_size: tuple = (1920, 3840),
+    fov: float = 70.0,
+    yaw: float = 0.0,
+    pitch: float = 0.0,
+    roll: float = 0.0,
+    device: torch.device = None
+) -> torch.Tensor:
+    """
+    Backproject 2D points from a perspective image to equirectangular coordinates.
+    
+    Args:
+        points: Tensor of shape (..., 2) containing (x, y) coordinates in perspective image
+        persp_size: Tuple (width, height) of the perspective image
+        eq_size: Tuple (height, width) of the equirectangular image (default 1920x3840)
+        fov: Horizontal field of view in degrees
+        yaw, pitch, roll: Camera orientation in degrees
+        device: Torch device
+    
+    Returns:
+        Tensor of shape (..., 2) containing (x, y) coordinates in equirectangular image
+    """
+    if device is None:
+        device = points.device
+    
+    out_w, out_h = persp_size
+    eq_h, eq_w = eq_size
+    
+    # FOV in radians
+    fov_rad = torch.deg2rad(torch.tensor(fov, dtype=torch.float32, device=device))
+    aspect = out_h / out_w
+    fov_y = 2 * torch.arctan(torch.tan(fov_rad / 2) * aspect)
+    
+    # Get original shape and flatten points
+    original_shape = points.shape[:-1]
+    points_flat = points.reshape(-1, 2)
+    
+    # Convert pixel coordinates to normalized coordinates in tangent plane
+    # x: [0, out_w] -> [-tan(fov/2), tan(fov/2)]
+    # y: [0, out_h] -> [tan(fov_y/2), -tan(fov_y/2)] (flipped for image coords)
+    tan_fov_x = torch.tan(fov_rad / 2)
+    tan_fov_y = torch.tan(fov_y / 2)
+    
+    x_norm = (points_flat[:, 0] / out_w - 0.5) * 2 * tan_fov_x
+    y_norm = -(points_flat[:, 1] / out_h - 0.5) * 2 * tan_fov_y  # flip y
+    
+    # Create 3D direction vectors (pinhole model, z=1)
+    z = torch.ones_like(x_norm)
+    directions = torch.stack([x_norm, y_norm, z], dim=-1)
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+    
+    # Apply rotation (camera orientation)
+    R = rot_matrix_torch(yaw, pitch, roll, device)
+    dirs_rot = directions @ R.T
+    
+    # Convert to spherical coordinates
+    lon = torch.atan2(dirs_rot[:, 0], dirs_rot[:, 2])
+    lat = torch.asin(torch.clamp(dirs_rot[:, 1], -1.0, 1.0))
+    
+    # Convert to equirectangular pixel coordinates
+    eq_x = (lon / (2 * torch.pi) + 0.5) * eq_w
+    eq_y = (0.5 - lat / torch.pi) * eq_h
+    
+    # Stack and reshape back
+    eq_points = torch.stack([eq_x, eq_y], dim=-1)
+    eq_points = eq_points.reshape(*original_shape, 2)
+    
+    return eq_points
+
+
+# Global variable for backprojection debug window
+_backproj_debug_frame = None
+
+
+def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict, current_tracks_history: dict, device: torch.device, image_size: tuple, backprojection: bool = False) -> np.ndarray:
     """
     Perform inference on the ActionNet model.
+    
+    Args:
+        backprojection: If True, backproject joint coordinates from perspective to 
+                       equirectangular (3840x1920) before normalization. Uses FOV=70°, 
+                       yaw/pitch/roll=0.
     """
+    global _backproj_debug_frame
     
     assert(config["mb_input_norm"] == "vid"), "Only video normalization is supported for live interaction prediction"
     
     min_valid_keypoints = config["min_keypoints_filter"]
-    input_length_in_frames = config["input_length_in_frames"]
+    input_length_in_frames = 16 #config["input_length_in_frames"]
     max_index_gap_allowed = 2
-    w,h = image_size
-    whtensor = torch.tensor([w, h], device=device)
+    
+    # Target size for normalization
+    eq_w, eq_h = (3840, 1920) if backprojection else image_size
+    whtensor = torch.tensor([eq_w, eq_h], device=device)
     
     # print(current_tracks_history.keys())
     return_dict = {track_id: "NC" for track_id in current_tracks_history.keys()}
@@ -322,8 +407,88 @@ def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict
         return return_dict
     
     valid_input_tensors = torch.stack(valid_input_tensors, dim=0) # B, T, 17, 3
+    
+    # Backprojection: perspective -> equirectangular
+    if backprojection:
+        persp_w, persp_h = image_size
+        # Extract xy coordinates and scores
+        xy_coords = valid_input_tensors[..., :2]  # B, T, 17, 2
+        scores = valid_input_tensors[..., 2:3]    # B, T, 17, 1
+        
+        # Backproject to equirectangular coordinates
+        eq_coords = backproject_points_to_equirect(
+            points=xy_coords,
+            persp_size=(persp_w, persp_h),
+            eq_size=(eq_h, eq_w),  # (height, width)
+            fov=70.0,
+            yaw=0.0,
+            pitch=0.0,
+            roll=0.0,
+            device=device
+        )
+        
+        # Recombine with scores
+        valid_input_tensors = torch.cat([eq_coords, scores], dim=-1)  # B, T, 17, 3
+        
+        # Debug visualization: show projected joints on equirectangular canvas
+        if args.display:
+            # Create debug canvas (scaled down for display)
+            debug_scale = 0.25
+            debug_w, debug_h = int(eq_w * debug_scale), int(eq_h * debug_scale)
+            debug_frame = np.zeros((debug_h, debug_w, 3), dtype=np.uint8)
+            debug_frame[:] = (30, 30, 30)  # Dark gray background
+            
+            # Draw grid lines for reference
+            for x in range(0, debug_w, debug_w // 8):
+                cv2.line(debug_frame, (x, 0), (x, debug_h), (50, 50, 50), 1)
+            for y in range(0, debug_h, debug_h // 4):
+                cv2.line(debug_frame, (0, y), (debug_w, y), (50, 50, 50), 1)
+            
+            # Draw joints and skeleton for each valid track (last frame only)
+            eq_coords_np = eq_coords.cpu().numpy()
+            scores_np = valid_input_tensors[..., 2].cpu().numpy()
+            
+            for i, track_id in enumerate(valid_ids):
+                color = get_track_color(track_id)
+                # Use last frame
+                kp = eq_coords_np[i, -1]  # 17, 2
+                sc = scores_np[i, -1]     # 17
+                
+                # Scale to debug frame
+                kp_scaled = kp * debug_scale
+                
+                # Draw skeleton
+                for j, k in COCO_SKELETON:
+                    if sc[j] > args.kp_thresh and sc[k] > args.kp_thresh:
+                        pt1 = (int(kp_scaled[j, 0]), int(kp_scaled[j, 1]))
+                        pt2 = (int(kp_scaled[k, 0]), int(kp_scaled[k, 1]))
+                        # Check if points are valid (within bounds)
+                        if 0 <= pt1[0] < debug_w and 0 <= pt1[1] < debug_h and \
+                           0 <= pt2[0] < debug_w and 0 <= pt2[1] < debug_h:
+                            cv2.line(debug_frame, pt1, pt2, color, 2)
+                
+                # Draw keypoints
+                for kp_idx, (kp_pt, score) in enumerate(zip(kp_scaled, sc)):
+                    if score > args.kp_thresh:
+                        x, y = int(kp_pt[0]), int(kp_pt[1])
+                        if 0 <= x < debug_w and 0 <= y < debug_h:
+                            cv2.circle(debug_frame, (x, y), 4, color, -1)
+                
+                # Draw track ID label
+                if sc[0] > args.kp_thresh:  # Use nose position
+                    label_x, label_y = int(kp_scaled[0, 0]), int(kp_scaled[0, 1]) - 10
+                    if 0 <= label_x < debug_w and 0 <= label_y < debug_h:
+                        cv2.putText(debug_frame, f"ID:{track_id}", (label_x, label_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            
+            # Add title
+            cv2.putText(debug_frame, "Backprojection Debug (Equirect 3840x1920)", (10, 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            _backproj_debug_frame = debug_frame
+    
     valid_input_tensors = coco2h36m(valid_input_tensors)
-    scale = min(w,h) / 2.0
+    scale = min(eq_w, eq_h) / 2.0
     valid_input_tensors[...,:2] = valid_input_tensors[...,:2] - whtensor / 2.0
     valid_input_tensors[...,:2] = valid_input_tensors[...,:2] / scale
     valid_input_tensors = valid_input_tensors.unsqueeze(1) # B, M, T, 17, 3
@@ -339,6 +504,12 @@ def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict
             return_dict[track_id] = probabilities[i].item()
             
     return return_dict
+
+
+def get_backproj_debug_frame():
+    """Get the latest backprojection debug frame for display."""
+    global _backproj_debug_frame
+    return _backproj_debug_frame
 
 
 def create_frame_iterator(args: argparse.Namespace):
@@ -387,7 +558,12 @@ def create_frame_iterator(args: argparse.Namespace):
         if args.depth is not None:
             depth_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.depth)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
             depth_paths.sort()
-            assert len(image_paths) == len(depth_paths), "Number of images and depth images must be the same"
+            if abs(len(image_paths) - len(depth_paths)) > 5:
+                raise ValueError(f"Number of images (in {args.directory}) and depth images (in {args.depth}) must be the same got {len(image_paths)} and {len(depth_paths)}")
+            else:
+                # cut to the same length
+                image_paths = image_paths[:len(depth_paths)]
+                depth_paths = depth_paths[:len(image_paths)]
         
         for frame_idx, image_path in enumerate(image_paths):
             image = Image.open(image_path).convert("RGB")
@@ -448,6 +624,7 @@ def process_input(args: argparse.Namespace) -> dict:
     
     for frame_idx, image, depth_image, total_frames in frame_iterator:
         t_frame_start = time.perf_counter()
+        t_ip = 0  # Initialize IP inference time
         
         # Detection + tracking + pose with YOLO pose model
         t_infer_start = time.perf_counter()
@@ -510,13 +687,16 @@ def process_input(args: argparse.Namespace) -> dict:
             
             if args.interaction_prediction_checkpoint is not None:
                 # perform ip for current tracks
+                t_ip_start = time.perf_counter()
                 current_tracks_history = {int(track_id): track_history[track_id] for track_id in current_track_ids}
                 ip_dict = action_net_inference(args, 
                                                      ip_model, 
                                                      ip_config, 
                                                      current_tracks_history, 
                                                      device=torch.device("cuda"), 
-                                                     image_size=(image.width, image.height))
+                                                     image_size=(image.width, image.height),
+                                                     backprojection=args.backprojection)
+                t_ip = time.perf_counter() - t_ip_start
 
                 for track_id, ip_output in ip_dict.items():
                     track_history[track_id]["ip_output"].append(ip_output)
@@ -577,16 +757,24 @@ def process_input(args: argparse.Namespace) -> dict:
                 frame_idx=frame_idx,
                 num_tracks=len(current_track_ids),
                 latency_ms=t_frame * 1000,
+                ip_latency_ms=t_ip * 1000,
             )
             display_frame = concatenate_with_panel(frame, panel)
             
             cv2.imshow("Pose", display_frame)
+            
+            # Show backprojection debug window if enabled
+            if args.backprojection:
+                backproj_frame = get_backproj_debug_frame()
+                if backproj_frame is not None:
+                    cv2.imshow("Backprojection Debug", backproj_frame)
+                    cv2.moveWindow("Backprojection Debug", 30,1280)  # Move it
             if cv2.waitKey(1) == ord("q"):
                 break
 
         t_frame = time.perf_counter() - t_frame_start
         print(f"Frame {frame_idx}/{total_frames} | {len(current_track_ids)} tracks | "
-              f"infer: {t_infer*1000:.1f}ms, total: {t_frame*1000:.1f}ms")
+              f"yolo: {t_infer*1000:.1f}ms, ip: {t_ip*1000:.1f}ms, total: {t_frame*1000:.1f}ms")
 
     if args.display:
         cv2.destroyAllWindows()
@@ -597,15 +785,47 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--directory", "-d", type=str, help="Path to folder containing images")
+    input_group.add_argument("--episode_directory", "-ed", type=str, help="Path to episode directory containing images")
     input_group.add_argument("--video", "-v", type=str, help="Path to video file")
+    parser.add_argument("--episode_input_type", "-eit", type=str, choices=["images_360", "images"], help="Type of episode input")
     parser.add_argument("--depth", type=str, default=None, help="Path to folder containing depth images (optional, only for directory input)")
     parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default=None, help="Path to interaction prediction checkpoint (optional)")
     parser.add_argument("--depth_scale", type=float, default=1000.0, help="Depth scale factor (depth units per meter, e.g., 1000 for mm)")
     parser.add_argument("--display", action="store_true", default=False, help="Display results with cv2")
     parser.add_argument("--kp_thresh", type=float, default=0.3, help="Keypoint confidence threshold")
+    parser.add_argument("--backprojection", "-bp", action="store_true", default=False, 
+                        help="Backproject joint coordinates from perspective to equirectangular (3840x1920) "
+                             "before IP inference. Uses FOV=70°, yaw/pitch/roll=0. Shows debug window when --display is enabled.")
     args = parser.parse_args()
     
-    history = process_input(args)
-    print(f"Processed {len(history)} unique tracks")
-    for track_id, data in history.items():
-        print(f"  Track {track_id}: {len(data['detections'])} frames")
+    if args.episode_directory is not None:
+        assert os.path.exists(args.episode_directory), "Episode directory does not exist"
+        if args.episode_directory.endswith("episodes") or args.episode_directory.endswith("episodes/"):
+            all_episodes = [d for d in os.listdir(args.episode_directory) if os.path.isdir(os.path.join(args.episode_directory, d))]
+            all_episodes.sort()
+            all_episodes = all_episodes[1:] # skip the first episode
+            multiple_episodes = True
+        else:
+            multiple_episodes = False
+            if args.episode_input_type == "images_360":
+                args.directory = os.path.join(args.episode_directory, "images_360")
+            elif args.episode_input_type == "images":
+                args.directory = os.path.join(args.episode_directory, "images")
+                args.depth = os.path.join(args.episode_directory, "depth")
+            else:
+                raise ValueError(f"Invalid episode input type: {args.episode_input_type}")
+    
+    if multiple_episodes:    
+        for episode in all_episodes:
+            image_dir_name = "images_360" if args.episode_input_type == "images_360" else "images"
+            args.directory = os.path.join(args.episode_directory, episode, image_dir_name)
+            args.depth = os.path.join(args.episode_directory, episode, "depth")
+            history = process_input(args)
+            print(f"Processed {len(history)} unique tracks in episode {episode}")
+            for track_id, data in history.items():
+                print(f"  Track {track_id}: {len(data['detections'])} frames in episode {episode}")
+    else:
+        history = process_input(args)
+        print(f"Processed {len(history)} unique tracks")
+        for track_id, data in history.items():
+            print(f"  Track {track_id}: {len(data['detections'])} frames")

@@ -102,6 +102,7 @@ class InfoPanel:
         frame_idx: int,
         num_tracks: int,
         latency_ms: float,
+        ip_latency_ms: float = 0.0,
     ) -> np.ndarray:
         """
         Draw the info panel.
@@ -111,6 +112,7 @@ class InfoPanel:
             frame_idx: Current frame index
             num_tracks: Current number of active tracks
             latency_ms: Processing latency in milliseconds
+            ip_latency_ms: Interaction prediction latency in milliseconds
             
         Returns:
             Panel image as numpy array (BGR)
@@ -131,6 +133,8 @@ class InfoPanel:
         cv2.putText(panel, f"Tracks: {num_tracks}", (10, y_text), font, font_scale, text_color, 1)
         y_text += line_height
         cv2.putText(panel, f"Latency: {latency_ms:.1f} ms", (10, y_text), font, font_scale, text_color, 1)
+        y_text += line_height
+        cv2.putText(panel, f"Int.Pred. Latency: {ip_latency_ms:.1f} ms", (10, y_text), font, font_scale, text_color, 1)
         y_text += line_height + 10
         
         # Calculate space for two graphs
