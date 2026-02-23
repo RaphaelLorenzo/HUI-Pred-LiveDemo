@@ -431,7 +431,7 @@ def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict
         valid_input_tensors = torch.cat([eq_coords, scores], dim=-1)  # B, T, 17, 3
         
         # Debug visualization: show projected joints on equirectangular canvas
-        if args.display:
+        if args.display or getattr(args, "save_output", False):
             # Create debug canvas (scaled down for display)
             debug_scale = 0.25
             debug_w, debug_h = int(eq_w * debug_scale), int(eq_h * debug_scale)
@@ -509,6 +509,19 @@ def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict
 def get_backproj_debug_frame():
     """Get the latest backprojection debug frame for display."""
     global _backproj_debug_frame
+    if _backproj_debug_frame is None:
+        debug_h, debug_w = int(1920*0.25), int(3840*0.25)
+        debug_frame = np.zeros((debug_h, debug_w, 3), dtype=np.uint8)
+        debug_frame[:] = (30, 30, 30)  # Dark gray background
+        
+        # Draw grid lines for reference
+        for x in range(0, debug_w, debug_w // 8):
+            cv2.line(debug_frame, (x, 0), (x, debug_h), (50, 50, 50), 1)
+        for y in range(0, debug_h, debug_h // 4):
+            cv2.line(debug_frame, (0, y), (debug_w, y), (50, 50, 50), 1)
+        
+        return debug_frame
+    
     return _backproj_debug_frame
 
 
@@ -550,13 +563,13 @@ def create_frame_iterator(args: argparse.Namespace):
         cap.release()
     else:
         # Folder input
-        image_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.directory)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
+        image_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.directory)) for f in fn if f.endswith(".jpg") or f.endswith(".jpeg") or f.endswith(".png")]
         image_paths.sort()
         total_frames = len(image_paths)
         
         depth_paths = None
         if args.depth is not None:
-            depth_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.depth)) for f in fn if f.endswith(".jpg") or f.endswith(".png")]
+            depth_paths = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(args.depth)) for f in fn if f.endswith(".jpg") or f.endswith(".jpeg") or f.endswith(".png")]
             depth_paths.sort()
             if abs(len(image_paths) - len(depth_paths)) > 5:
                 raise ValueError(f"Number of images (in {args.directory}) and depth images (in {args.depth}) must be the same got {len(image_paths)} and {len(depth_paths)}")
@@ -611,16 +624,32 @@ def process_input(args: argparse.Namespace) -> dict:
         
         print(f"Loaded model of type {type(ip_model).__name__} and weights from checkpoint")    
     
-    # Initialize info panel for display
+    # Initialize info panel for display and/or save
     info_panel = InfoPanel(
         width=600,
         history_length=100,
         min_track_appearances=16,
         y_max_meters=6.0,
-    ) if args.display else None
+    ) if (args.display or getattr(args, "save_output", False)) else None
     
     # Create frame iterator
     frame_iterator = create_frame_iterator(args)
+    
+    # Video writers for save_output
+    save_output = getattr(args, "save_output", False)
+    video_writer_main = None
+    video_writer_backproj = None
+    output_basename = None
+    if save_output:
+        if args.video is not None:
+            output_basename = Path(args.video).stem
+        else:
+            output_basename = Path(args.directory).name if args.directory else "output"
+            if "/episodes/" in args.directory:
+                output_basename = args.directory.split("/")[-4:]
+                output_basename = "_".join(output_basename)
+            print(f"Saving output to ./output/videos/{output_basename}.mp4")
+        os.makedirs("./output/videos", exist_ok=True)
     
     for frame_idx, image, depth_image, total_frames in frame_iterator:
         t_frame_start = time.perf_counter()
@@ -701,8 +730,8 @@ def process_input(args: argparse.Namespace) -> dict:
                 for track_id, ip_output in ip_dict.items():
                     track_history[track_id]["ip_output"].append(ip_output)
 
-        # Display
-        if args.display:
+        # Display and/or build frames for save_output
+        if args.display or save_output:
             frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             for i, track_id in enumerate(current_track_ids):
                 color = get_track_color(int(track_id))
@@ -761,21 +790,53 @@ def process_input(args: argparse.Namespace) -> dict:
             )
             display_frame = concatenate_with_panel(frame, panel)
             
-            cv2.imshow("Pose", display_frame)
+            if args.display:
+                cv2.imshow("Pose", display_frame)
             
             # Show backprojection debug window if enabled
-            if args.backprojection:
+            if args.display and args.backprojection:
                 backproj_frame = get_backproj_debug_frame()
                 if backproj_frame is not None:
                     cv2.imshow("Backprojection Debug", backproj_frame)
                     cv2.moveWindow("Backprojection Debug", 30,1280)  # Move it
-            if cv2.waitKey(1) == ord("q"):
+            if args.display and cv2.waitKey(1) == ord("q"):
                 break
+            
+            # Save output to videos when enabled
+            if save_output:
+                backproj_frame = get_backproj_debug_frame() if args.backprojection else None
+                # Initialize writers on first frame
+                if video_writer_main is None:
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    fps = 30.0
+                    h_main, w_main = display_frame.shape[:2]
+                    video_writer_main = cv2.VideoWriter(
+                        f"./output/videos/{output_basename}.mp4",
+                        fourcc, fps, (w_main, h_main)
+                    )
+                    if args.backprojection and backproj_frame is not None:
+                        h_bp, w_bp = backproj_frame.shape[:2]
+                        video_writer_backproj = cv2.VideoWriter(
+                            f"./output/videos/{output_basename}_backprojection.mp4",
+                            fourcc, fps, (w_bp, h_bp)
+                        )
+                video_writer_main.write(display_frame)
+                if video_writer_backproj is not None and backproj_frame is not None:
+                    video_writer_backproj.write(backproj_frame)
 
         t_frame = time.perf_counter() - t_frame_start
         print(f"Frame {frame_idx}/{total_frames} | {len(current_track_ids)} tracks | "
               f"yolo: {t_infer*1000:.1f}ms, ip: {t_ip*1000:.1f}ms, total: {t_frame*1000:.1f}ms")
 
+    if save_output:
+        saved_backproj = video_writer_backproj is not None
+        if video_writer_main is not None:
+            video_writer_main.release()
+        if video_writer_backproj is not None:
+            video_writer_backproj.release()
+        print(f"Saved main output to ./output/videos/{output_basename}.mp4")
+        if saved_backproj:
+            print(f"Saved backprojection to ./output/videos/{output_basename}_backprojection.mp4")
     if args.display:
         cv2.destroyAllWindows()
     return track_history
@@ -796,14 +857,17 @@ if __name__ == "__main__":
     parser.add_argument("--backprojection", "-bp", action="store_true", default=False, 
                         help="Backproject joint coordinates from perspective to equirectangular (3840x1920) "
                              "before IP inference. Uses FOV=70°, yaw/pitch/roll=0. Shows debug window when --display is enabled.")
+    parser.add_argument("--save_output", "-so", action="store_true", default=False,
+                        help="Save the displayed output to ./output/videos/ (main view and backprojection visu when --backprojection).")
     args = parser.parse_args()
-    
+    multiple_episodes = False
     if args.episode_directory is not None:
         assert os.path.exists(args.episode_directory), "Episode directory does not exist"
         if args.episode_directory.endswith("episodes") or args.episode_directory.endswith("episodes/"):
             all_episodes = [d for d in os.listdir(args.episode_directory) if os.path.isdir(os.path.join(args.episode_directory, d))]
             all_episodes.sort()
             all_episodes = all_episodes[1:] # skip the first episode
+            print(f"Found {len(all_episodes)} episodes")
             multiple_episodes = True
         else:
             multiple_episodes = False
@@ -819,6 +883,7 @@ if __name__ == "__main__":
         for episode in all_episodes:
             image_dir_name = "images_360" if args.episode_input_type == "images_360" else "images"
             args.directory = os.path.join(args.episode_directory, episode, image_dir_name)
+            print(f"[DIRECTORY] {args.directory}")
             args.depth = os.path.join(args.episode_directory, episode, "depth")
             history = process_input(args)
             print(f"Processed {len(history)} unique tracks in episode {episode}")

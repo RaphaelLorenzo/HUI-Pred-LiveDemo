@@ -3,3 +3,6 @@
 *.pth
 checkpoints
 __pycache__
+*.mp4
+*.gif
+output/videos/
