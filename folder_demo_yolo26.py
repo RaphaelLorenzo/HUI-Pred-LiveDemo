@@ -804,6 +804,8 @@ def process_input(args: argparse.Namespace) -> dict:
             
             # Save output to videos when enabled
             if save_output:
+                model_basename = args.interaction_prediction_checkpoint.split("/")[-1].split(".")[0]
+                output_basename_full = f"{output_basename}_{model_basename}"
                 backproj_frame = get_backproj_debug_frame() if args.backprojection else None
                 # Initialize writers on first frame
                 if video_writer_main is None:
@@ -811,13 +813,13 @@ def process_input(args: argparse.Namespace) -> dict:
                     fps = 30.0
                     h_main, w_main = display_frame.shape[:2]
                     video_writer_main = cv2.VideoWriter(
-                        f"./output/videos/{output_basename}.mp4",
+                        f"./output/videos/{output_basename_full}.mp4",
                         fourcc, fps, (w_main, h_main)
                     )
                     if args.backprojection and backproj_frame is not None:
                         h_bp, w_bp = backproj_frame.shape[:2]
                         video_writer_backproj = cv2.VideoWriter(
-                            f"./output/videos/{output_basename}_backprojection.mp4",
+                            f"./output/videos/{output_basename_full}_backprojection.mp4",
                             fourcc, fps, (w_bp, h_bp)
                         )
                 video_writer_main.write(display_frame)
@@ -834,9 +836,9 @@ def process_input(args: argparse.Namespace) -> dict:
             video_writer_main.release()
         if video_writer_backproj is not None:
             video_writer_backproj.release()
-        print(f"Saved main output to ./output/videos/{output_basename}.mp4")
+        print(f"Saved main output to ./output/videos/{output_basename_full}.mp4")
         if saved_backproj:
-            print(f"Saved backprojection to ./output/videos/{output_basename}_backprojection.mp4")
+            print(f"Saved backprojection to ./output/videos/{output_basename_full}_backprojection.mp4")
     if args.display:
         cv2.destroyAllWindows()
     return track_history
