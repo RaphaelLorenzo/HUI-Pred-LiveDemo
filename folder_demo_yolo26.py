@@ -8,7 +8,7 @@ from PIL import Image
 from ultralytics import YOLO
 import torch
 import torch.nn as nn
-from utils.visualization import InfoPanel, get_track_color, concatenate_with_panel
+from utils.visualization import InfoPanel, BehaviorPanel, get_track_color, concatenate_with_panel
 from utils.geometry_utils import rot_matrix_torch
 from functools import partial
 
@@ -19,6 +19,19 @@ from predictors.MotionBERT.lib.model.model_action import ActionNet
 from predictors.STG_NF.model_pose import STG_NF
 from predictors.STGCN.net.st_gcn import Model as STGCN
 from predictors.SkateFormer.model.SkateFormer import SkateFormer
+
+# -----------------------------------------------------------------------------
+# Behavior prototype thresholds (for "someone wants to interact" detection)
+# -----------------------------------------------------------------------------
+# Threshold above which a person is considered potentially engaged
+INITIAL_INTERACTION_PREDICTION_THRESHOLD = 0.1
+# Minimum consecutive frames above threshold to be considered "engaged"
+INITIAL_MIN_FRAMES_ENGAGED = 2
+# Consecutive frames below threshold to be considered "disengaged"
+BREAKUP_FRAMES_DISENGAGED = 10
+# Engagement score range used to scale lights: below MIN = idle (blue), above MAX = offering (green)
+MIN_LIGHTS_SCALE_THRESHOLD = 0.1
+MAX_LIGHTS_SCALE_THRESHOLD = 0.8
 
 # COCO pose skeleton connections (17 keypoints format)
 COCO_SKELETON = [
@@ -631,7 +644,8 @@ def process_input(args: argparse.Namespace) -> dict:
         min_track_appearances=16,
         y_max_meters=6.0,
     ) if (args.display or getattr(args, "save_output", False)) else None
-    
+    behavior_panel = BehaviorPanel(width=220) if (args.display or getattr(args, "save_output", False)) else None
+
     # Create frame iterator
     frame_iterator = create_frame_iterator(args)
     
@@ -779,7 +793,19 @@ def process_input(args: argparse.Namespace) -> dict:
             # Prune old tracks from panel history
             info_panel.prune_old_tracks(frame_idx)
             
-            # Draw info panel and concatenate
+            # Engagement-based lights scale: max IP score over current tracks, mapped to [MIN, MAX] -> [0, 1]
+            max_engagement_score = 0.0
+            for tid in current_track_ids:
+                tid = int(tid)
+                if tid in track_history and track_history[tid]["ip_output"]:
+                    v = track_history[tid]["ip_output"][-1]
+                    if isinstance(v, (int, float)):
+                        max_engagement_score = max(max_engagement_score, float(v))
+            span = max(1e-6, MAX_LIGHTS_SCALE_THRESHOLD - MIN_LIGHTS_SCALE_THRESHOLD)
+            lights_scale = (max_engagement_score - MIN_LIGHTS_SCALE_THRESHOLD) / span
+            lights_scale = max(0.0, min(1.0, lights_scale))
+            
+            # Draw info panel and behavior panel, then concatenate
             t_frame = time.perf_counter() - t_frame_start
             panel = info_panel.draw(
                 frame_height=frame.shape[0],
@@ -788,7 +814,8 @@ def process_input(args: argparse.Namespace) -> dict:
                 latency_ms=t_frame * 1000,
                 ip_latency_ms=t_ip * 1000,
             )
-            display_frame = concatenate_with_panel(frame, panel)
+            behavior_img = behavior_panel.draw(frame_height=frame.shape[0], lights_scale=lights_scale)
+            display_frame = concatenate_with_panel(frame, panel, behavior_img)
             
             if args.display:
                 cv2.imshow("Pose", display_frame)

@@ -341,6 +341,143 @@ class InfoPanel:
                 cv2.putText(panel, f"{int(x_val)}", (px - 10, bottom + 12), font, font_scale, label_color, 1)
 
 
-def concatenate_with_panel(frame: np.ndarray, panel: np.ndarray) -> np.ndarray:
-    """Concatenate the main frame with the info panel on the right."""
+def concatenate_with_panel(frame: np.ndarray, panel: np.ndarray, *extra_panels: np.ndarray) -> np.ndarray:
+    """Concatenate the main frame with the info panel(s) on the right."""
+    if extra_panels:
+        return np.hstack([frame, panel, *extra_panels])
     return np.hstack([frame, panel])
+
+
+class BehaviorPanel:
+    """
+    Side panel for behavior prototypes (e.g. lights Idle -> Offering interaction).
+    First third: two round lights (blue -> green) with engagement.
+    Second third: two eyes — almost closed/bored when idle, wide open and expressive when engaged.
+    Third: reserved for future behavior.
+    """
+
+    # Idle = low-intensity blue (BGR)
+    LIGHT_IDLE_COLOR = (180, 100, 40)   # dim blue
+    # Offering = bright green (BGR)
+    LIGHT_OFFERING_COLOR = (80, 255, 80)  # bright green
+
+    def __init__(self, width: int = 220):
+        self.width = width
+
+    def draw(
+        self,
+        frame_height: int,
+        lights_scale: float,
+    ) -> np.ndarray:
+        """
+        Draw the behavior panel.
+
+        Args:
+            frame_height: Height of the main frame (panel will match).
+            lights_scale: 0.0 = idle (blue), 1.0 = offering (green). Linear blend
+                          of color and intensity between idle and offering.
+
+        Returns:
+            Panel image as numpy array (BGR).
+        """
+        lights_scale = max(0.0, min(1.0, float(lights_scale)))
+        panel = np.zeros((frame_height, self.width, 3), dtype=np.uint8)
+        panel[:] = (28, 28, 28)
+
+        # Panel divided in three horizontal bands (for 3 behavior types)
+        third = frame_height // 3
+        # First third: "Lights" behavior — two round lights
+        self._draw_lights_section(panel, 0, third, lights_scale)
+        # Second third: "Eyes" behavior — two eyes (bored/closed -> wide open)
+        self._draw_eyes_section(panel, third, 2 * third, lights_scale)
+        # Third: placeholder for future behavior
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(panel, "Behavior 3", (10, 2 * third + 30), font, 0.45, (120, 120, 120), 1)
+
+        # Title at top
+        cv2.putText(panel, "Behaviors", (10, 22), font, 0.6, (220, 220, 220), 1)
+        return panel
+
+    def _draw_lights_section(self, panel: np.ndarray, y_start: int, y_end: int, lights_scale: float):
+        """Draw the first behavior: two round lights (blue -> green) in the given vertical band."""
+        h_section = y_end - y_start
+        if h_section < 40:
+            return
+        cx = self.width // 2
+        cy = y_start + h_section // 2
+        radius = min(28, (self.width - 40) // 4, h_section // 4)
+        gap = max(20, radius)
+        left_cx = cx - gap // 2 - radius
+        right_cx = cx + gap // 2 + radius
+
+        # Interpolate color: idle blue -> offering green
+        b0, g0, r0 = self.LIGHT_IDLE_COLOR
+        b1, g1, r1 = self.LIGHT_OFFERING_COLOR
+        b = int(b0 + (b1 - b0) * lights_scale)
+        g = int(g0 + (g1 - g0) * lights_scale)
+        r = int(r0 + (r1 - r0) * lights_scale)
+        # Intensity: start low (idle), end bright (offering)
+        intensity = 0.35 + 0.65 * lights_scale
+        color = (int(b * intensity), int(g * intensity), int(r * intensity))
+
+        for px in (left_cx, right_cx):
+            cv2.circle(panel, (px, cy), radius, color, -1)
+            border_color = (min(255, color[0] + 40), min(255, color[1] + 40), min(255, color[2] + 40))
+            cv2.circle(panel, (px, cy), radius, border_color, 1)
+
+        cv2.putText(panel, "Lights", (10, y_start + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1)
+        label = "Idle" if lights_scale < 0.1 else ("Offering" if lights_scale > 0.9 else "Transition")
+        cv2.putText(panel, label, (10, y_end - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (130, 130, 130), 1)
+
+    def _draw_eyes_section(self, panel: np.ndarray, y_start: int, y_end: int, engagement_scale: float):
+        """
+        Draw the second behavior: two eyes that go from almost closed/bored (idle)
+        to wide open and positively expressive (engaged).
+        """
+        h_section = y_end - y_start
+        if h_section < 50:
+            return
+        cx = self.width // 2
+        cy = y_start + h_section // 2
+        eye_half_gap = 24
+        left_cx = cx - eye_half_gap
+        right_cx = cx + eye_half_gap
+
+        ax_x = 14
+        ax_y_idle = 2
+        ax_y_engaged = 11
+        ax_y = ax_y_idle + (ax_y_engaged - ax_y_idle) * engagement_scale
+        angle_idle = -12
+        angle_engaged = 3
+        angle = angle_idle + (angle_engaged - angle_idle) * engagement_scale
+
+        eye_outer_idle = (70, 70, 75)
+        eye_outer_engaged = (245, 245, 250)
+        b = int(eye_outer_idle[0] + (eye_outer_engaged[0] - eye_outer_idle[0]) * engagement_scale)
+        g = int(eye_outer_idle[1] + (eye_outer_engaged[1] - eye_outer_idle[1]) * engagement_scale)
+        r = int(eye_outer_idle[2] + (eye_outer_engaged[2] - eye_outer_idle[2]) * engagement_scale)
+        eye_color = (b, g, r)
+
+        for ex in (left_cx, right_cx):
+            if engagement_scale < 0.15:
+                pt1 = (ex - ax_x, cy)
+                pt2 = (ex + ax_x, cy)
+                cv2.line(panel, pt1, pt2, (90, 90, 95), 2)
+            else:
+                cv2.ellipse(
+                    panel, (ex, cy), (int(ax_x), int(ax_y)), angle, 0, 360, eye_color, -1
+                )
+                cv2.ellipse(
+                    panel, (ex, cy), (int(ax_x), int(ax_y)), angle, 0, 360, (60, 60, 65), 1
+                )
+                if engagement_scale > 0.5:
+                    iris_radius = int(4 + 3 * engagement_scale)
+                    iris_offset_y = int(2 * engagement_scale)
+                    cv2.circle(panel, (ex, cy + iris_offset_y), iris_radius, (200, 160, 80), -1)
+                    cv2.circle(panel, (ex, cy + iris_offset_y), iris_radius, (50, 50, 60), 1)
+                    if engagement_scale > 0.7:
+                        cv2.circle(panel, (ex + 2, cy + iris_offset_y - 2), 2, (255, 255, 255), -1)
+
+        cv2.putText(panel, "Eyes", (10, y_start + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1)
+        label = "Bored" if engagement_scale < 0.15 else ("Engaged" if engagement_scale > 0.85 else "Opening")
+        cv2.putText(panel, label, (10, y_end - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (130, 130, 130), 1)
