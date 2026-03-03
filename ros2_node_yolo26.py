@@ -1,18 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.10
 """
 ROS2 node for real-time human-robot interaction prediction using YOLO pose estimation.
 
 Subscribes to CompressedImage topics for RGB and depth, runs YOLO pose detection
-+ tracking, and performs interaction prediction using a pre-trained model.
++ tracking, and publishes bounding box, track_id, and predicted interaction score
+on /huipred/detections.
 
-Usage:
-    python3 ros2_node_yolo26.py --ros-args \
-        -p rgb_topic:=/camera/color/image_raw/compressed \
-        -p depth_topic:=/camera/depth/image_raw/compressed \
-        -p interaction_prediction_checkpoint:=checkpoints/model.pt \
-        -p display:=true
+In Docker (ROS Humble uses Python 3.10), run with:
+    python3.10 ros2_node_yolo26.py --rgb_topic /camera/color/image_raw/compressed --depth_topic /camera/depth/image_raw/compressed --interaction_prediction_checkpoint checkpoints/mb_FineTuned_28_02_26_best_ap.pth
 """
 
+import argparse
 import types
 import time
 import cv2
@@ -26,10 +24,10 @@ import torch.nn as nn
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
+from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose
 import message_filters
 
 from ultralytics import YOLO
-from utils.visualization import InfoPanel, BehaviorPanel, get_track_color, concatenate_with_panel
 from utils.geometry_utils import rot_matrix_torch
 
 from predictors.mlp import MLPInteractionPredictor
@@ -48,12 +46,6 @@ INITIAL_MIN_FRAMES_ENGAGED = 2
 BREAKUP_FRAMES_DISENGAGED = 10
 MIN_LIGHTS_SCALE_THRESHOLD = 0.1
 MAX_LIGHTS_SCALE_THRESHOLD = 0.8
-
-COCO_SKELETON = [
-    [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
-    [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9],
-    [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6]
-]
 
 METADATA_CKPT_COLUMNS = [
     "recording", "episode", "image_height", "image_width",
@@ -251,7 +243,6 @@ def action_net_inference(
     args, model: ActionNet, config: dict,
     current_tracks_history: dict, device: torch.device,
     image_size: tuple, backprojection: bool = False,
-    backproj_debug_holder: dict | None = None,
 ) -> dict:
     """Run ActionNet interaction prediction on current tracks."""
     assert config["mb_input_norm"] == "vid"
@@ -297,40 +288,6 @@ def action_net_inference(
         )
         valid_input_tensors = torch.cat([eq_coords, scores], dim=-1)
 
-        if backproj_debug_holder is not None and (args.display or getattr(args, "save_output", False)):
-            debug_scale = 0.25
-            dw, dh = int(eq_w * debug_scale), int(eq_h * debug_scale)
-            dbg = np.zeros((dh, dw, 3), dtype=np.uint8)
-            dbg[:] = (30, 30, 30)
-            for x in range(0, dw, dw // 8):
-                cv2.line(dbg, (x, 0), (x, dh), (50, 50, 50), 1)
-            for y in range(0, dh, dh // 4):
-                cv2.line(dbg, (0, y), (dw, y), (50, 50, 50), 1)
-            eq_np = eq_coords.cpu().numpy()
-            sc_np = valid_input_tensors[..., 2].cpu().numpy()
-            for i, tid in enumerate(valid_ids):
-                color = get_track_color(tid)
-                kp = eq_np[i, -1] * debug_scale
-                sc = sc_np[i, -1]
-                for j, k in COCO_SKELETON:
-                    if sc[j] > args.kp_thresh and sc[k] > args.kp_thresh:
-                        p1 = (int(kp[j, 0]), int(kp[j, 1]))
-                        p2 = (int(kp[k, 0]), int(kp[k, 1]))
-                        if 0 <= p1[0] < dw and 0 <= p1[1] < dh and 0 <= p2[0] < dw and 0 <= p2[1] < dh:
-                            cv2.line(dbg, p1, p2, color, 2)
-                for idx2, (pt, s) in enumerate(zip(kp, sc)):
-                    if s > args.kp_thresh:
-                        px, py = int(pt[0]), int(pt[1])
-                        if 0 <= px < dw and 0 <= py < dh:
-                            cv2.circle(dbg, (px, py), 4, color, -1)
-                if sc[0] > args.kp_thresh:
-                    lx, ly = int(kp[0, 0]), int(kp[0, 1]) - 10
-                    if 0 <= lx < dw and 0 <= ly < dh:
-                        cv2.putText(dbg, f"ID:{tid}", (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            cv2.putText(dbg, "Backprojection Debug (Equirect 3840x1920)", (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            backproj_debug_holder["frame"] = dbg
-
     valid_input_tensors = coco2h36m(valid_input_tensors)
     scale = min(eq_w, eq_h) / 2.0
     valid_input_tensors[..., :2] = (valid_input_tensors[..., :2] - whtensor / 2.0) / scale
@@ -353,33 +310,20 @@ def action_net_inference(
 # ---------------------------------------------------------------------------
 
 class HUIPredNode(Node):
-    def __init__(self):
+    def __init__(self, args: argparse.Namespace):
         super().__init__("hui_pred_node")
 
-        # -- Declare parameters --
-        self.declare_parameter("rgb_topic", "/camera/color/image_raw/compressed")
-        self.declare_parameter("depth_topic", "")
-        self.declare_parameter("yolo_model_path", "checkpoints/yolo26x-pose.pt")
-        self.declare_parameter("interaction_prediction_checkpoint", "")
-        self.declare_parameter("kp_thresh", 0.3)
-        self.declare_parameter("depth_scale", 1000.0)
-        self.declare_parameter("backprojection", False)
-        self.declare_parameter("display", False)
-        self.declare_parameter("publish_annotated", True)
-
-        rgb_topic = self.get_parameter("rgb_topic").value
-        depth_topic = self.get_parameter("depth_topic").value
-        yolo_path = self.get_parameter("yolo_model_path").value
-        ip_ckpt = self.get_parameter("interaction_prediction_checkpoint").value
+        rgb_topic = args.rgb_topic
+        depth_topic = args.depth_topic or ""
+        yolo_path = args.yolo_model_path
+        ip_ckpt = args.interaction_prediction_checkpoint or ""
         self._use_depth = depth_topic != ""
 
         # Args-like namespace consumed by helper functions
         self._args = types.SimpleNamespace(
-            kp_thresh=self.get_parameter("kp_thresh").value,
-            depth_scale=self.get_parameter("depth_scale").value,
-            backprojection=self.get_parameter("backprojection").value,
-            display=self.get_parameter("display").value,
-            save_output=False,
+            kp_thresh=args.kp_thresh,
+            depth_scale=args.depth_scale,
+            backprojection=args.backprojection,
             interaction_prediction_checkpoint=ip_ckpt if ip_ckpt else None,
         )
 
@@ -413,28 +357,15 @@ class HUIPredNode(Node):
                 )
             self.get_logger().info("IP model loaded successfully")
 
-        # -- Visualisation panels --
-        self.info_panel = None
-        self.behavior_panel = None
-        if self._args.display:
-            self.info_panel = InfoPanel(
-                width=600, history_length=100,
-                min_track_appearances=16, y_max_meters=6.0,
-            )
-            self.behavior_panel = BehaviorPanel(width=220)
-
         # -- State --
         self.track_history: dict = {}
         self.frame_idx = 0
-        self._backproj_debug: dict = {"frame": None}
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # -- Publisher --
-        self._pub_annotated = None
-        if self.get_parameter("publish_annotated").value:
-            self._pub_annotated = self.create_publisher(
-                CompressedImage, "~/annotated/compressed", 10
-            )
+        # -- Publisher: /huipred/detections (bbox, track_id, interaction_score) --
+        self._pub_detections = self.create_publisher(
+            Detection2DArray, "/huipred/detections", 10
+        )
 
         # -- Subscribers --
         if self._use_depth:
@@ -572,87 +503,34 @@ class HUIPredNode(Node):
                     device=self._device,
                     image_size=(image.width, image.height),
                     backprojection=args.backprojection,
-                    backproj_debug_holder=self._backproj_debug,
                 )
                 t_ip = time.perf_counter() - t_ip_s
                 for tid, val in ip_dict.items():
                     self.track_history[tid]["ip_output"].append(val)
 
-        # -- Visualisation / publishing --
-        if args.display or self._pub_annotated is not None:
-            frame = bgr.copy()
-            for i, tid_raw in enumerate(current_track_ids):
-                tid = int(tid_raw)
-                color = get_track_color(tid)
-                x1, y1, x2, y2 = boxes[i].astype(int)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-                label = f"ID:{tid}"
-                if depths[i] is not None and depths[i] > 0:
-                    label += f" {depths[i]:.2f}m"
-                if tid in self.track_history and self.track_history[tid]["ip_output"]:
-                    v = self.track_history[tid]["ip_output"][-1]
-                    label += f" IP:{v:.1%}" if isinstance(v, float) else f" IP:{v}"
-                cv2.putText(frame, label, (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                kp = keypoints_all[i]
-                sc = scores_all[i]
-                for j, k in COCO_SKELETON:
-                    if sc[j] > args.kp_thresh and sc[k] > args.kp_thresh:
-                        cv2.line(frame, tuple(kp[j].astype(int)),
-                                 tuple(kp[k].astype(int)), color, 2)
-                for pt, s in zip(kp, sc):
-                    if s > args.kp_thresh:
-                        cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, color, -1)
-
-                if self.info_panel is not None:
-                    self.info_panel.update_track_depth(tid, self.frame_idx, depths[i])
-                    if tid in self.track_history and self.track_history[tid]["ip_output"]:
-                        self.info_panel.update_track_ip(
-                            tid, self.frame_idx,
-                            self.track_history[tid]["ip_output"][-1],
-                        )
-
-            if self.info_panel is not None:
-                self.info_panel.prune_old_tracks(self.frame_idx)
-
-                max_eng = 0.0
-                for tid_raw in current_track_ids:
-                    tid = int(tid_raw)
-                    if tid in self.track_history and self.track_history[tid]["ip_output"]:
-                        v = self.track_history[tid]["ip_output"][-1]
-                        if isinstance(v, (int, float)):
-                            max_eng = max(max_eng, float(v))
-                span = max(1e-6, MAX_LIGHTS_SCALE_THRESHOLD - MIN_LIGHTS_SCALE_THRESHOLD)
-                lights_scale = max(0.0, min(1.0,
-                    (max_eng - MIN_LIGHTS_SCALE_THRESHOLD) / span))
-
-                t_frame = time.perf_counter() - t_start
-                panel = self.info_panel.draw(
-                    frame_height=frame.shape[0], frame_idx=self.frame_idx,
-                    num_tracks=len(current_track_ids),
-                    latency_ms=t_frame * 1000, ip_latency_ms=t_ip * 1000,
-                )
-                beh = self.behavior_panel.draw(
-                    frame_height=frame.shape[0], lights_scale=lights_scale,
-                )
-                frame = concatenate_with_panel(frame, panel, beh)
-
-            if args.display:
-                cv2.imshow("Pose", frame)
-                if args.backprojection and self._backproj_debug.get("frame") is not None:
-                    cv2.imshow("Backprojection Debug", self._backproj_debug["frame"])
-                if cv2.waitKey(1) == ord("q"):
-                    self.get_logger().info("Quit requested")
-                    raise SystemExit
-
-            if self._pub_annotated is not None:
-                out_msg = CompressedImage()
-                out_msg.header.stamp = self.get_clock().now().to_msg()
-                out_msg.format = "jpeg"
-                out_msg.data = np.array(cv2.imencode(".jpg", frame)[1]).tobytes()
-                self._pub_annotated.publish(out_msg)
+        # -- Publish detections on /huipred/detections --
+        msg = Detection2DArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "camera_optical_frame"
+        for i, tid_raw in enumerate(current_track_ids):
+            tid = int(tid_raw)
+            x1, y1, x2, y2 = boxes[i]
+            det = Detection2D()
+            det.header = msg.header
+            det.bbox.center.x = float((x1 + x2) / 2.0)
+            det.bbox.center.y = float((y1 + y2) / 2.0)
+            det.bbox.size_x = float(x2 - x1)
+            det.bbox.size_y = float(y2 - y1)
+            hyp = ObjectHypothesisWithPose()
+            hyp.class_id = str(tid)
+            if tid in self.track_history and self.track_history[tid]["ip_output"]:
+                v = self.track_history[tid]["ip_output"][-1]
+                hyp.score = float(v) if isinstance(v, (int, float)) else -1.0
+            else:
+                hyp.score = -1.0
+            det.results.append(hyp)
+            msg.detections.append(det)
+        self._pub_detections.publish(msg)
 
         t_total = time.perf_counter() - t_start
         self.get_logger().info(
@@ -666,15 +544,32 @@ class HUIPredNode(Node):
 # ---------------------------------------------------------------------------
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = HUIPredNode()
+    parser = argparse.ArgumentParser(
+        description="ROS2 node for HUI-Pred: subscribe to RGB/depth CompressedImage topics, run YOLO pose + interaction prediction.",
+    )
+    parser.add_argument("--rgb_topic", "-r", type=str, default="/camera/color/image_raw/compressed",
+                        help="Topic for RGB CompressedImage")
+    parser.add_argument("--depth_topic", "-dt", type=str, default=None,
+                        help="Topic for depth CompressedImage (optional; if set, RGB and depth are time-synced)")
+    parser.add_argument("--yolo_model_path", "-y", type=str, default="checkpoints/yolo26x-pose.pt",
+                        help="Path to YOLO pose model")
+    parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default="checkpoints/mb_FineTuned_28_02_26_best_ap.pth",
+                        help="Path to interaction prediction checkpoint (optional)")
+    parser.add_argument("--kp_thresh", type=float, default=0.3,
+                        help="Keypoint confidence threshold")
+    parser.add_argument("--depth_scale", type=float, default=1000.0,
+                        help="Depth scale factor (depth units per meter, e.g. 1000 for mm)")
+    parser.add_argument("--backprojection", "-bp", action="store_true", default=False,
+                        help="Backproject joints from perspective to equirect before IP inference")
+    parsed_args, ros_args = parser.parse_known_args(args)
+
+    rclpy.init(args=ros_args)
+    node = HUIPredNode(parsed_args)
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        if node._args.display:
-            cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
