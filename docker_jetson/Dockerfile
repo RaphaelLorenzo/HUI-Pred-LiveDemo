@@ -1,65 +1,61 @@
-FROM dustynv/ros:humble-desktop-l4t-r36.4.0
+FROM dustynv/l4t-pytorch:r36.4.0
 
-SHELL ["/bin/bash", "--login", "-c"]
-ENV TZ=Europe/Paris
+ENV TZ=US/Pacific
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+SHELL ["/bin/bash", "--login", "-c"]
+
 ###### Install Python Dependencies
+RUN apt-get update -y
+
+RUN python3 -m pip install --index-url https://pypi.org/simple opencv-python-headless imageio
+
+ENV OPENCV_IO_ENABLE_OPENEXR=1
+
+RUN pip install --index-url https://pypi.org/simple scikit-learn einops timm ultralytics==8.4
+
+###### Install ROS2
+ENV ROS_DISTRO=humble
 RUN apt-get update && apt-get upgrade -yy
-
 RUN apt-get install -y \
-    python-is-python3 \
-    python3-pip
+    curl \
+    gnupg2 \
+    lsb-release
 
-# RUN pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
-RUN export TORCH_INSTALL=https://developer.download.nvidia.cn/compute/redist/jp/v512/pytorch/torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl
-RUN pip install --upgrade pip; python3 -m pip install numpy==1.26.1; python3 -m pip install --no-cache $TORCH_INSTALL
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+RUN echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null
+RUN apt-get update && apt-get upgrade -y
+RUN apt install ros-humble-desktop-full -y
+RUN apt install ros-dev-tools -y
+RUN rosdep init && rosdep update
 
+###### Install ROS Dependencies
+RUN apt install -y \
+    ros-${ROS_DISTRO}-cv-bridge \
+    ros-${ROS_DISTRO}-rviz2
 
+###### Set up ROS2 for conda environment (Python 3.10)
+# ROS2 apt packages are built for Python 3.10, which matches our conda environment
+# Add ROS2 Python packages to PYTHONPATH so they can be imported in conda
+RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && \
+    echo "export LD_LIBRARY_PATH=/opt/ros/humble/lib:\$LD_LIBRARY_PATH" >> ~/.bashrc && \
+    echo "export AMENT_PREFIX_PATH=/opt/ros/humble:\$AMENT_PREFIX_PATH" >> ~/.bashrc && \
+    echo "export ROS_DOMAIN_ID=0" >> ~/.bashrc && \
+    echo "export PYTHONPATH=/opt/ros/humble/lib/python3.10/site-packages:\$PYTHONPATH" >> ~/.bashrc
 
+###### Update Buffer
+RUN sysctl net.ipv4.ipfrag_time=3
+RUN sysctl net.ipv4.ipfrag_high_thresh=134217728
 
+RUN echo "export FASTDDS_BUILTIN_TRANSPORTS=LARGE_DATA?max_msg_size=1MB&soets_size=1MB&non_blocking=true&tcp_negotiation_timeout=50" >> ~/.bashrc
 
-# RUN pip install scipy joblib ruamel.yaml pyyaml opencv-python imageio einops
+###### Source ROS2 and workspace (ros2_ws only if present, e.g. mounted)
+RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc
+RUN echo "[ -f /ros2_ws/install/setup.bash ] && source /ros2_ws/install/setup.bash" >> ~/.bashrc
 
-# ENV OPENCV_IO_ENABLE_OPENEXR=1
+RUN apt-get update && apt-get install -y ros-humble-rmw-cyclonedds-cpp
+RUN echo "export ROS_DOMAIN_ID=42" >> ~/.bashrc
 
-# RUN pip install scikit-image webdataset omegaconf
-
-# RUN pip install openpyxl wandb imgaug Ninja xlsxwriter timm albumentations xatlas rtree ultralytics==8.0.120 pycocotools videoio numba
-
-# RUN pip install h5py
-
-# ###### Install ROS2
-# ENV ROS_DISTRO=humble
-
-
-# ###### Set up ROS2 for conda environment (Python 3.10)
-# # ROS2 apt packages are built for Python 3.10, which matches our conda environment
-# # Add ROS2 Python packages to PYTHONPATH so they can be imported in conda
-# RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && \
-#     echo "export LD_LIBRARY_PATH=/opt/ros/humble/lib:\$LD_LIBRARY_PATH" >> ~/.bashrc && \
-#     echo "export AMENT_PREFIX_PATH=/opt/ros/humble:\$AMENT_PREFIX_PATH" >> ~/.bashrc && \
-#     echo "export ROS_DOMAIN_ID=0" >> ~/.bashrc && \
-#     echo "export PYTHONPATH=/opt/ros/humble/lib/python3.10/site-packages:\$PYTHONPATH" >> ~/.bashrc
-
-# ###### Update Buffer
-# RUN sysctl net.ipv4.ipfrag_time=3
-# RUN sysctl net.ipv4.ipfrag_high_thresh=134217728
-
-# RUN echo "export FASTDDS_BUILTIN_TRANSPORTS=LARGE_DATA?max_msg_size=1MB&soets_size=1MB&non_blocking=true&tcp_negotiation_timeout=50" >> ~/.bashrc
-
-# ###### Source ROS2 and workspace (ros2_ws only if present, e.g. mounted)
-# RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc
-# RUN echo "[ -f /ros2_ws/install/setup.bash ] && source /ros2_ws/install/setup.bash" >> ~/.bashrc
-
-# RUN apt-get update && apt-get install -y ros-humble-rmw-cyclonedds-cpp
-# RUN echo "export ROS_DOMAIN_ID=1" >> ~/.bashrc
-
-
-# # Fix versions !
-# RUN pip install ultralytics==8.4
-
-
-# # Setup shell
-# ENV SHELL=/bin/bash
-# RUN ln -sf /bin/bash /bin/sh
+# Setup shell
+ENV SHELL=/bin/bash
+RUN ln -sf /bin/bash /bin/sh
