@@ -20,6 +20,8 @@ from predictors.STG_NF.model_pose import STG_NF
 from predictors.STGCN.net.st_gcn import Model as STGCN
 from predictors.SkateFormer.model.SkateFormer import SkateFormer
 
+from utils.other_utils import read_yaml_to_dic
+
 # -----------------------------------------------------------------------------
 # Behavior prototype thresholds (for "someone wants to interact" detection)
 # -----------------------------------------------------------------------------
@@ -41,7 +43,7 @@ COCO_SKELETON = [
 ]
 
 
-def estimate_torso_depth(keypoints: np.ndarray, scores: np.ndarray, depth_image: np.ndarray, kp_thresh: float) -> float | None:
+def estimate_torso_depth(keypoints: np.ndarray, scores: np.ndarray, depth_image: np.ndarray, kp_thresh: float):
     """
     Estimate depth at the center of the torso using diagonal sampling.
     
@@ -613,29 +615,40 @@ def process_input(args: argparse.Namespace) -> dict:
     ip_model = None
     ip_config = None
     if args.interaction_prediction_checkpoint is not None:
-        ip_checkpoint = torch.load(args.interaction_prediction_checkpoint, map_location='cpu', weights_only=False) 
-        # Make sure the checkpoint contains the model weights
-        if 'model_state_dict' not in ip_checkpoint:
-            raise ValueError("Checkpoint does not contain 'model_state_dict' key. Cannot load model weights.")
         
-        # Extract config and handle backward compatibility
-        if 'config' not in ip_checkpoint:
-            if 'hyperparameters' in ip_checkpoint:
-                ip_checkpoint["config"] = ip_checkpoint["hyperparameters"]
-            raise ValueError("Checkpoint does not contain 'config' or 'hyperparameters' key. Cannot recreate dataloader.")
+        if os.path.isdir(args.interaction_prediction_checkpoint) and "converted_" in args.interaction_prediction_checkpoint:
+            assert(os.path.exists(os.path.join(args.interaction_prediction_checkpoint, "meta.yaml"))), "Meta file not found"
+            meta = read_yaml_to_dic(os.path.join(args.interaction_prediction_checkpoint, "meta.yaml"))
+            ip_config = meta["config"]
+            ip_model = load_model_from_config(ip_config, device="cuda")
+            ip_model.load_state_dict(torch.load(os.path.join(args.interaction_prediction_checkpoint, "model_state_dict.pt"), map_location='cpu'), strict=True)
+            if type(ip_model) != ActionNet:
+                raise NotImplementedError(f"Model type {type(ip_model).__name__} not supported for live interaction prediction for now")
+            print(f"Loaded model of type {type(ip_model).__name__} and weights from checkpoint")    
+        elif os.path.isfile(args.interaction_prediction_checkpoint):
+            ip_checkpoint = torch.load(args.interaction_prediction_checkpoint, map_location='cpu', weights_only=False) 
+            # Make sure the checkpoint contains the model weights
+            if 'model_state_dict' not in ip_checkpoint:
+                raise ValueError("Checkpoint does not contain 'model_state_dict' key. Cannot load model weights.")
+            
+            # Extract config and handle backward compatibility
+            if 'config' not in ip_checkpoint:
+                if 'hyperparameters' in ip_checkpoint:
+                    ip_checkpoint["config"] = ip_checkpoint["hyperparameters"]
+                raise ValueError("Checkpoint does not contain 'config' or 'hyperparameters' key. Cannot recreate dataloader.")
 
-        ip_config = ip_checkpoint['config']
-        print(f"Model type: {ip_config['force_model_type']} | cross evaluation type: {ip_config['cross_eval_type']}")
-        print(f"AUC {ip_checkpoint['val_auc']:.4f} | AP {ip_checkpoint['val_ap']:.4f}")
-        
-        print(ip_config.keys())
-        
-        ip_model = load_model_from_config(ip_config, device="cuda")
-        ip_model.load_state_dict(ip_checkpoint['model_state_dict'], strict=True)
-        if type(ip_model) != ActionNet:
-            raise NotImplementedError(f"Model type {type(ip_model).__name__} not supported for live interaction prediction for now")
-        
-        print(f"Loaded model of type {type(ip_model).__name__} and weights from checkpoint")    
+            ip_config = ip_checkpoint['config']
+            print(f"Model type: {ip_config['force_model_type']} | cross evaluation type: {ip_config['cross_eval_type']}")
+            print(f"AUC {ip_checkpoint['val_auc']:.4f} | AP {ip_checkpoint['val_ap']:.4f}")
+            
+            print(ip_config.keys())
+            
+            ip_model = load_model_from_config(ip_config, device="cuda")
+            ip_model.load_state_dict(ip_checkpoint['model_state_dict'], strict=True)
+            if type(ip_model) != ActionNet:
+                raise NotImplementedError(f"Model type {type(ip_model).__name__} not supported for live interaction prediction for now")
+            
+            print(f"Loaded model of type {type(ip_model).__name__} and weights from checkpoint")    
     
     # Initialize info panel for display and/or save
     info_panel = InfoPanel(
