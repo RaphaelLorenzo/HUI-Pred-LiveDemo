@@ -23,13 +23,15 @@ if [ "$IsRunning" -eq "0" ]; then
         -v /tmp:/tmp \
         -e DISPLAY=${DISPLAY} \
         -e GIT_INDEX_FILE \
-        -e ROS_DOMAIN_ID=1 \
-        -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
-        -e CYCLONEDDS_URI=/xml_configs/cyclonedds.xml \
-        -v $(pwd)/configs/:/xml_configs \
+        -e ROS_DOMAIN_ID=42 \
         huipreddemo_jetson:latest \
-        bash -c "source /opt/ros/humble/setup.bash && cd $DIR && bash"
+        bash -c "cd $DIR && bash"
 else
     echo "huipreddemo_jetson container is already running. Opening new terminal..."
     docker exec -ti huipreddemo_jetson bash -c "source /opt/ros/humble/setup.bash && cd $DIR && bash"
 fi
+
+
+        # -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+        # -e CYCLONEDDS_URI=/xml_configs/cyclonedds.xml \
+        # -v $(pwd)/configs/:/xml_configs \

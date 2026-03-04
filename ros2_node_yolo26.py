@@ -14,7 +14,6 @@ import argparse
 import types
 import time
 import cv2
-import numpy as np
 from PIL import Image
 from functools import partial
 
@@ -37,6 +36,13 @@ from predictors.MotionBERT.lib.model.model_action import ActionNet
 from predictors.STG_NF.model_pose import STG_NF
 from predictors.STGCN.net.st_gcn import Model as STGCN
 from predictors.SkateFormer.model.SkateFormer import SkateFormer
+
+import sys
+import numpy as np
+
+# Create a bridge between NumPy 1.x and 2.x naming conventions
+# if not hasattr(np, "_core"):
+#     sys.modules["numpy._core"] = np.core
 
 # ---------------------------------------------------------------------------
 # Behavior prototype thresholds
@@ -64,7 +70,7 @@ def estimate_torso_depth(
     scores: np.ndarray,
     depth_image: np.ndarray,
     kp_thresh: float,
-) -> float | None:
+):
     """
     Estimate depth at the center of the torso using diagonal sampling.
 
@@ -96,7 +102,7 @@ def estimate_torso_depth(
     return float(np.median(depth_samples))
 
 
-def load_model_from_config(config: dict, device: torch.device) -> torch.nn.Module:
+def load_model_from_config(config: dict, device: torch.device):
     include_columns = config["include_columns"]
     data_columns = [c for c in include_columns if c not in METADATA_CKPT_COLUMNS]
     input_dim = len(data_columns)
@@ -179,7 +185,7 @@ def load_model_from_config(config: dict, device: torch.device) -> torch.nn.Modul
     return model
 
 
-def coco2h36m(x: torch.Tensor) -> torch.Tensor:
+def coco2h36m(x: torch.Tensor):
     """Convert COCO 17-keypoint format to H36M 17-keypoint format.  x: (B, T, 17, C)"""
     y = torch.zeros(x.shape, device=x.device)
     y[:, :, 0, :] = (x[:, :, 11, :] + x[:, :, 12, :]) * 0.5
@@ -211,7 +217,7 @@ def backproject_points_to_equirect(
     pitch: float = 0.0,
     roll: float = 0.0,
     device: torch.device = None,
-) -> torch.Tensor:
+):
     """Backproject 2D perspective points to equirectangular coordinates."""
     if device is None:
         device = points.device
@@ -243,7 +249,7 @@ def action_net_inference(
     args, model: ActionNet, config: dict,
     current_tracks_history: dict, device: torch.device,
     image_size: tuple, backprojection: bool = False,
-) -> dict:
+):
     """Run ActionNet interaction prediction on current tracks."""
     assert config["mb_input_norm"] == "vid"
     min_valid_keypoints = config["min_keypoints_filter"]
@@ -389,13 +395,13 @@ class HUIPredNode(Node):
     # ----- message decoding ---------------------------------------------------
 
     @staticmethod
-    def _decode_compressed_rgb(msg: CompressedImage) -> np.ndarray:
+    def _decode_compressed_rgb(msg: CompressedImage):
         """Decode a CompressedImage to a BGR numpy array."""
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
     @staticmethod
-    def _decode_compressed_depth(msg: CompressedImage) -> np.ndarray | None:
+    def _decode_compressed_depth(msg: CompressedImage):
         """Decode a CompressedImage carrying depth data.
 
         Handles both raw-compressed (PNG/TIFF) and the ROS compressedDepth
@@ -432,7 +438,7 @@ class HUIPredNode(Node):
 
     # ----- main per-frame pipeline -------------------------------------------
 
-    def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray | None):
+    def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray):
         t_start = time.perf_counter()
         t_ip = 0.0
         args = self._args
