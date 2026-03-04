@@ -14,6 +14,7 @@ import argparse
 import types
 import time
 import cv2
+import os
 from PIL import Image
 from functools import partial
 
@@ -341,22 +342,27 @@ class HUIPredNode(Node):
         self.ip_model = None
         self.ip_config = None
         if ip_ckpt:
+            assert("converted_" in ip_ckpt), "IP checkpoint must be a converted checkpoint, use the convert_checkpoints.py script to convert the checkpoint (split state dict and config)"
             self.get_logger().info(f"Loading IP checkpoint from {ip_ckpt}")
-            ckpt = torch.load(ip_ckpt, map_location="cpu", weights_only=False)
-            if "model_state_dict" not in ckpt:
-                raise ValueError("Checkpoint missing 'model_state_dict'")
-            if "config" not in ckpt:
-                if "hyperparameters" in ckpt:
-                    ckpt["config"] = ckpt["hyperparameters"]
-                else:
-                    raise ValueError("Checkpoint missing 'config'/'hyperparameters'")
-            self.ip_config = ckpt["config"]
+            
+            # first load the config
+            assert(os.path.exists(os.path.join(ip_ckpt, "meta.yaml"))), "Meta file not found"
+            meta = read_yaml_to_dic(os.path.join(ip_ckpt, "meta.yaml"))
+            self.ip_config = meta["config"]
+
             self.get_logger().info(
                 f"IP model type: {self.ip_config['force_model_type']} | "
-                f"AUC {ckpt.get('val_auc', 0):.4f} | AP {ckpt.get('val_ap', 0):.4f}"
+                f"AUC {meta.get('val_auc', 0):.4f} | AP {meta.get('val_ap', 0):.4f}"
             )
+
+            # then load the state dict
+            assert(os.path.exists(os.path.join(ip_ckpt, "model_state_dict.pt"))), "Model state dict not found"
+            model_state_dict = torch.load(os.path.join(ip_ckpt, "model_state_dict.pt"), map_location="cpu")
+
             self.ip_model = load_model_from_config(self.ip_config, device="cuda")
-            self.ip_model.load_state_dict(ckpt["model_state_dict"], strict=True)
+            self.ip_model.load_state_dict(model_state_dict, strict=True)
+            
+            
             if not isinstance(self.ip_model, ActionNet):
                 raise NotImplementedError(
                     f"{type(self.ip_model).__name__} not yet supported for live IP"
