@@ -554,23 +554,36 @@ class HUIPredNode(Node):
         overlay = bgr.copy()
         for i, tid_raw in enumerate(current_track_ids):
             tid = int(tid_raw)
-            color = get_track_color(tid)
-            x1, y1, x2, y2 = boxes[i].astype(int)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
 
             label = f"ID:{tid}"
             if tid in self.track_history and self.track_history[tid]["ip_output"]:
                 v = self.track_history[tid]["ip_output"][-1]
+                ip_score = None
                 if isinstance(v, (int, float)):
                     label += f" IP:{v:.2f}"
+                    ip_score = v
                 else:
-                    label += f" IP:{v}"
+                    label += f" {v}"
+                    ip_score = 0.0
+
+            # color = get_track_color(tid)
+            # Make a color from red (0.0) to green (1.0) based on ip_score value
+            color = (0, 0, 255)  # default to red (BGR), fallback if no ip_score
+            if 'ip_score' in locals() and ip_score is not None:
+                # Clamp ip_score within [0.0, 1.0]
+                v = max(0.0, min(1.0, float(ip_score)))
+                # Interpolate: green = v, red = 1-v (BGR format)
+                red = int(255 * (1.0 - v))
+                green = int(255 * v)
+                color = (0, green, red)
+            x1, y1, x2, y2 = boxes[i].astype(int)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 8)
                     
             # Calculate center position of the bounding box
             center_x = (x1 + x2) // 2
             center_y = (y1 + y2) // 2
-            font_scale = 2.5  # 5 times as big as original 0.5
-            thickness = 5
+            font_scale = 3.5  # 5 times as big as original 0.5
+            thickness = 10
             font = cv2.FONT_HERSHEY_SIMPLEX
             # Get text size
             (text_width, text_height), base_line = cv2.getTextSize(label, font, font_scale, thickness)
