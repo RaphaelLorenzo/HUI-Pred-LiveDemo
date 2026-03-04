@@ -565,8 +565,18 @@ class HUIPredNode(Node):
                     label += f" IP:{v:.2f}"
                 else:
                     label += f" IP:{v}"
-            cv2.putText(overlay, label, (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+            # Calculate center position of the bounding box
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            font_scale = 2.5  # 5 times as big as original 0.5
+            thickness = 5
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            # Get text size
+            (text_width, text_height), base_line = cv2.getTextSize(label, font, font_scale, thickness)
+            # Calculate position so that text is centered
+            text_org = (center_x - text_width // 2, center_y + text_height // 2)
+            cv2.putText(overlay, label, text_org, font, font_scale, color, thickness)
 
             kp = keypoints_all[i]
             sc = scores_all[i]

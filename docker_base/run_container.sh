@@ -23,7 +23,7 @@ if [ "$IsRunning" -eq "0" ]; then
         -v /tmp:/tmp \
         -e DISPLAY=${DISPLAY} \
         -e GIT_INDEX_FILE \
-        -e ROS_DOMAIN_ID=1 \
+        -e ROS_DOMAIN_ID=42 \
         -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
         -e CYCLONEDDS_URI=/xml_configs/cyclonedds.xml \
         -v $(pwd)/configs/:/xml_configs \
