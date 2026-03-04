@@ -24,7 +24,7 @@ import torch.nn as nn
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose
+from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose, Pose2D
 import message_filters
 
 from ultralytics import YOLO
@@ -40,10 +40,7 @@ from predictors.SkateFormer.model.SkateFormer import SkateFormer
 
 import sys
 import numpy as np
-
-# Create a bridge between NumPy 1.x and 2.x naming conventions
-# if not hasattr(np, "_core"):
-#     sys.modules["numpy._core"] = np.core
+from utils.other_utils import read_yaml_to_dic
 
 # ---------------------------------------------------------------------------
 # Behavior prototype thresholds
@@ -529,10 +526,15 @@ class HUIPredNode(Node):
             x1, y1, x2, y2 = boxes[i]
             det = Detection2D()
             det.header = msg.header
-            det.bbox.center.x = float((x1 + x2) / 2.0)
-            det.bbox.center.y = float((y1 + y2) / 2.0)
-            det.bbox.size_x = float(x2 - x1)
-            det.bbox.size_y = float(y2 - y1)
+            pose = Pose2D()
+            pose.position.x = float((x1 + x2) / 2.0)
+            pose.position.y = float((y1 + y2) / 2.0)
+            pose.theta = 0.0
+            det.pose = pose
+            # det.bbox.center.x = float((x1 + x2) / 2.0)
+            # det.bbox.center.y = float((y1 + y2) / 2.0)
+            # det.bbox.size_x = float(x2 - x1)
+            # det.bbox.size_y = float(y2 - y1)
             hyp = ObjectHypothesisWithPose()
             hyp.class_id = str(tid)
             if tid in self.track_history and self.track_history[tid]["ip_output"]:
@@ -565,7 +567,7 @@ def main(args=None):
                         help="Topic for depth CompressedImage (optional; if set, RGB and depth are time-synced)")
     parser.add_argument("--yolo_model_path", "-y", type=str, default="checkpoints/yolo26x-pose.pt",
                         help="Path to YOLO pose model")
-    parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default="checkpoints/mb_FineTuned_28_02_26_best_ap.pth",
+    parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default="checkpoints/converted_mb_FineTuned_28_02_26_best_ap",
                         help="Path to interaction prediction checkpoint (optional)")
     parser.add_argument("--kp_thresh", type=float, default=0.3,
                         help="Keypoint confidence threshold")

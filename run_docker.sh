@@ -7,6 +7,7 @@ if [ "$IsRunning" -eq "0" ]; then
     xhost +local:docker
     docker run --rm \
         --name huipreddemo_jetson \
+        --runtime nvidia \
         --gpus all \
         --env NVIDIA_DISABLE_REQUIRE=1 \
         -it \
