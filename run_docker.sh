@@ -29,7 +29,7 @@ if [ "$IsRunning" -eq "0" ]; then
         bash -c "cd $DIR && bash"
 else
     echo "huipreddemo_jetson container is already running. Opening new terminal..."
-    docker exec -ti huipreddemo_jetson bash -c "source /opt/ros/humble/setup.bash && cd $DIR && bash"
+    docker exec -ti huipreddemo_jetson bash -c "cd $DIR && bash"
 fi
 
 
