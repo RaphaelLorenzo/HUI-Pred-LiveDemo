@@ -3,14 +3,15 @@
 ROS2 node for real-time human-robot interaction prediction using YOLO pose estimation.
 
 Subscribes to CompressedImage topics for RGB and depth, runs YOLO pose detection
-+ tracking, and publishes bounding box, track_id, and predicted interaction score
-on /huipred/detections.
++ tracking, and publishes an annotated overlay image with bounding boxes,
+track IDs, skeleton, and predicted interaction scores on /huipred/overlay/compressed.
 
 In Docker (ROS Humble uses Python 3.10), run with:
     python3.10 ros2_node_yolo26.py --rgb_topic /camera/color/image_raw/compressed --depth_topic /camera/depth/image_raw/compressed --interaction_prediction_checkpoint checkpoints/mb_FineTuned_28_02_26_best_ap.pth
 """
 
 import argparse
+import threading
 import types
 import time
 import cv2
@@ -18,17 +19,25 @@ import os
 from PIL import Image
 from functools import partial
 
-import torch
-import torch.nn as nn
-
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose, Pose2D
 import message_filters
 
+
+# WARNING : this is very weird : but if ultralytics is imported after torch, the YOLO model does not work (no detections !)
 from ultralytics import YOLO
+# pose_model = YOLO("checkpoints/yolo26x-pose.pt")
+# results_test = pose_model("frame_000146.jpg", verbose=True)[0]
+# print(f"Results test: {results_test.boxes.id}")
+# exit()
+
+# IMPORTANT : import torch after ultralytics !
+import torch
+import torch.nn as nn
+
 from utils.geometry_utils import rot_matrix_torch
+from utils.visualization import get_track_color
 
 from predictors.mlp import MLPInteractionPredictor
 from predictors.lstm import LSTMInteractionPredictor
@@ -50,6 +59,12 @@ INITIAL_MIN_FRAMES_ENGAGED = 2
 BREAKUP_FRAMES_DISENGAGED = 10
 MIN_LIGHTS_SCALE_THRESHOLD = 0.1
 MAX_LIGHTS_SCALE_THRESHOLD = 0.8
+
+COCO_SKELETON = [
+    [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
+    [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9],
+    [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
+]
 
 METADATA_CKPT_COLUMNS = [
     "recording", "episode", "image_height", "image_width",
@@ -325,6 +340,7 @@ class HUIPredNode(Node):
 
         # Args-like namespace consumed by helper functions
         self._args = types.SimpleNamespace(
+            debug=args.debug,
             kp_thresh=args.kp_thresh,
             depth_scale=args.depth_scale,
             backprojection=args.backprojection,
@@ -334,7 +350,7 @@ class HUIPredNode(Node):
         # -- Load YOLO pose model --
         self.get_logger().info(f"Loading YOLO pose model from {yolo_path}")
         self.pose_model = YOLO(yolo_path)
-
+        
         # -- Load interaction-prediction model (optional) --
         self.ip_model = None
         self.ip_config = None
@@ -370,10 +386,11 @@ class HUIPredNode(Node):
         self.track_history: dict = {}
         self.frame_idx = 0
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._process_lock = threading.Lock()
 
-        # -- Publisher: /huipred/detections (bbox, track_id, interaction_score) --
-        self._pub_detections = self.create_publisher(
-            Detection2DArray, "/huipred/detections", 10
+        # -- Publisher: /huipred/overlay (annotated image with detections) --
+        self._pub_overlay = self.create_publisher(
+            CompressedImage, "/huipred/overlay/compressed", 10
         )
 
         # -- Subscribers --
@@ -442,6 +459,15 @@ class HUIPredNode(Node):
     # ----- main per-frame pipeline -------------------------------------------
 
     def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray):
+        if not self._process_lock.acquire(blocking=False):
+            self.get_logger().debug("Skipping frame — previous frame still processing")
+            return
+        try:
+            self._process_frame_locked(bgr, depth_image)
+        finally:
+            self._process_lock.release()
+
+    def _process_frame_locked(self, bgr: np.ndarray, depth_image: np.ndarray):
         t_start = time.perf_counter()
         t_ip = 0.0
         args = self._args
@@ -455,6 +481,13 @@ class HUIPredNode(Node):
         t_infer = time.perf_counter()
         results = self.pose_model.track(image, persist=True, verbose=False)[0]
         t_infer = time.perf_counter() - t_infer
+                
+        if args.debug:
+            orig_image = results.orig_img
+            debug_img_path = f"./debug_frames/frame_orig_image_yolo_{self.frame_idx:06d}.jpg"
+            self.get_logger().info(f"Saving debug frame to {debug_img_path}")
+            os.makedirs(os.path.dirname(debug_img_path), exist_ok=True)
+            cv2.imwrite(debug_img_path, cv2.cvtColor(np.array(orig_image), cv2.COLOR_RGB2BGR))
 
         if results.boxes.id is None:
             current_track_ids = []
@@ -517,34 +550,41 @@ class HUIPredNode(Node):
                 for tid, val in ip_dict.items():
                     self.track_history[tid]["ip_output"].append(val)
 
-        # -- Publish detections on /huipred/detections --
-        msg = Detection2DArray()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "camera_optical_frame"
+        # -- Draw overlay and publish annotated image --
+        overlay = bgr.copy()
         for i, tid_raw in enumerate(current_track_ids):
             tid = int(tid_raw)
-            x1, y1, x2, y2 = boxes[i]
-            det = Detection2D()
-            det.header = msg.header
-            pose = Pose2D()
-            pose.position.x = float((x1 + x2) / 2.0)
-            pose.position.y = float((y1 + y2) / 2.0)
-            pose.theta = 0.0
-            det.pose = pose
-            # det.bbox.center.x = float((x1 + x2) / 2.0)
-            # det.bbox.center.y = float((y1 + y2) / 2.0)
-            # det.bbox.size_x = float(x2 - x1)
-            # det.bbox.size_y = float(y2 - y1)
-            hyp = ObjectHypothesisWithPose()
-            hyp.class_id = str(tid)
+            color = get_track_color(tid)
+            x1, y1, x2, y2 = boxes[i].astype(int)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+
+            label = f"ID:{tid}"
             if tid in self.track_history and self.track_history[tid]["ip_output"]:
                 v = self.track_history[tid]["ip_output"][-1]
-                hyp.score = float(v) if isinstance(v, (int, float)) else -1.0
-            else:
-                hyp.score = -1.0
-            det.results.append(hyp)
-            msg.detections.append(det)
-        self._pub_detections.publish(msg)
+                if isinstance(v, (int, float)):
+                    label += f" IP:{v:.2f}"
+                else:
+                    label += f" IP:{v}"
+            cv2.putText(overlay, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            kp = keypoints_all[i]
+            sc = scores_all[i]
+            for j, k in COCO_SKELETON:
+                if sc[j] > args.kp_thresh and sc[k] > args.kp_thresh:
+                    pt1 = tuple(kp[j].astype(int))
+                    pt2 = tuple(kp[k].astype(int))
+                    cv2.line(overlay, pt1, pt2, color, 2)
+            for kp_pt, score in zip(kp, sc):
+                if score > args.kp_thresh:
+                    cv2.circle(overlay, (int(kp_pt[0]), int(kp_pt[1])), 4, color, -1)
+
+        img_msg = CompressedImage()
+        img_msg.header.stamp = self.get_clock().now().to_msg()
+        img_msg.header.frame_id = "camera_optical_frame"
+        img_msg.format = "jpeg"
+        img_msg.data = np.array(cv2.imencode(".jpg", overlay)[1]).tobytes()
+        self._pub_overlay.publish(img_msg)
 
         t_total = time.perf_counter() - t_start
         self.get_logger().info(
@@ -575,6 +615,8 @@ def main(args=None):
                         help="Depth scale factor (depth units per meter, e.g. 1000 for mm)")
     parser.add_argument("--backprojection", "-bp", action="store_true", default=False,
                         help="Backproject joints from perspective to equirect before IP inference")
+    parser.add_argument("--debug", "-d", action="store_true", default=False,
+                        help="Save debug frames")
     parsed_args, ros_args = parser.parse_known_args(args)
 
     rclpy.init(args=ros_args)

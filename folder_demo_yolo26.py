@@ -6,6 +6,14 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from ultralytics import YOLO
+
+# # Load model
+pose_model = YOLO("checkpoints/yolo26x-pose.pt")
+
+# results_test = pose_model("frame_000146.jpg", verbose=True)[0]
+# print(f"Results test: {results_test.boxes.id}")
+# exit()
+
 import torch
 import torch.nn as nn
 from utils.visualization import InfoPanel, BehaviorPanel, get_track_color, concatenate_with_panel
@@ -89,10 +97,6 @@ def estimate_torso_depth(keypoints: np.ndarray, scores: np.ndarray, depth_image:
         return -1.0  # Sentinel value for no valid samples
     
     return float(np.median(depth_samples))
-
-
-# Load model
-pose_model = YOLO("checkpoints/yolo26x-pose.pt")
 
 
 METADATA_CKPT_COLUMNS = ["recording", 
