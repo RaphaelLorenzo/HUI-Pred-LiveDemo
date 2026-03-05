@@ -493,7 +493,7 @@ class HUIPredNode(Node):
         if self._min_interval is not None:
             now = time.perf_counter()
             if (now - self._last_process_time) < self._min_interval:
-                self.get_logger().info(f"Skipping frame — not enough time has passed (time difference: {now - self._last_process_time:.2f}s)")
+                self.get_logger().info(f"Skipping frame — not enough time has passed (time difference: {now - self._last_process_time:.4f}s)")
                 self._process_lock.release()
                 return
             
