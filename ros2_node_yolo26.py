@@ -120,12 +120,13 @@ def load_model_from_config(config: dict, device: torch.device):
     data_columns = [c for c in include_columns if c not in METADATA_CKPT_COLUMNS]
     input_dim = len(data_columns)
 
-    if "select_input_range" in config and config["select_input_range"] != [[0, -1]]:
-        sequence_length = config["select_input_range"][1] - config["select_input_range"][0]
-    else:
-        sequence_length = config["input_length_in_frames"] // config["subsample_frames"]
+    if "select_input_range" in config:
+        assert config["select_input_range"] == [0, -1], "select_input_range must be [0, -1] for live interaction prediction"
+    
+    sequence_length = config["input_length_in_frames"] // config["subsample_frames"]
 
-    assert config["subsample_frames"] == 1, "Subsampling not supported for live prediction"
+    # Subsampling is handled by running the pipeline at target_fps = source_fps / subsample_frames
+    # (frame dropping in the ROS node); no need to restrict model loading here.
 
     mt = config["force_model_type"]
 
@@ -263,10 +264,20 @@ def action_net_inference(
     current_tracks_history: dict, device: torch.device,
     image_size: tuple, backprojection: bool = False,
 ):
-    """Run ActionNet interaction prediction on current tracks."""
+    """Run ActionNet interaction prediction on current tracks.
+
+    Expects track history at target_fps (source_fps / subsample_frames), so we take
+    the last sequence_length = input_length_in_frames // subsample_frames frames.
+    """
     assert config["mb_input_norm"] == "vid"
     min_valid_keypoints = config["min_keypoints_filter"]
-    input_length_in_frames = 16
+    subsample_frames = config["subsample_frames"]
+    if "select_input_range" in config:
+        assert config["select_input_range"] == [0, -1], "select_input_range must be [0, -1] for live interaction prediction"
+
+    input_length_in_frames = config["input_length_in_frames"]
+    sequence_length = input_length_in_frames // subsample_frames
+    min_frames_inference = max(1, input_length_in_frames // 2)  # ActionNet: allow half window
     max_index_gap_allowed = 2
 
     eq_w, eq_h = (3840, 1920) if backprojection else image_size
@@ -278,14 +289,14 @@ def action_net_inference(
     for track_id, track_history in current_tracks_history.items():
         indexes = track_history["indexes"]
         input_tensors = track_history["ip_input_tensor"]
-        if len(indexes) < input_length_in_frames:
+        if len(indexes) < min_frames_inference:
             return_dict[track_id] = "not_enough_frames"
             continue
-        last_idx = np.array(indexes[-input_length_in_frames:])
+        last_idx = np.array(indexes[-sequence_length:])
         if np.any(np.diff(last_idx) > max_index_gap_allowed):
             return_dict[track_id] = "index_gap_too_large"
             continue
-        last_t = torch.stack(input_tensors[-input_length_in_frames:], dim=0)
+        last_t = torch.stack(input_tensors[-sequence_length:], dim=0)
         if torch.any((last_t[:, :, 2] > args.kp_thresh).sum(dim=1) < min_valid_keypoints):
             return_dict[track_id] = "not_enough_valid_joints"
             continue
@@ -382,6 +393,18 @@ class HUIPredNode(Node):
                 )
             self.get_logger().info("IP model loaded successfully")
 
+            # Target FPS = source_fps / subsample_frames; run YOLO+IP only at that rate
+            subsample_frames = self.ip_config["subsample_frames"]
+            target_fps = args.source_fps / subsample_frames
+            self._min_interval = 1.0 / target_fps if target_fps > 0 else 0.0
+            self._last_process_time = 0.0
+            self.get_logger().info(
+                f"Subsample frames={subsample_frames} -> target FPS={target_fps:.1f} (min_interval={self._min_interval*1000:.0f}ms)"
+            )
+        else:
+            self._min_interval = None
+            self._last_process_time = 0.0
+
         # -- State --
         self.track_history: dict = {}
         self.frame_idx = 0
@@ -459,6 +482,11 @@ class HUIPredNode(Node):
     # ----- main per-frame pipeline -------------------------------------------
 
     def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray):
+        # Throttle to target FPS when subsampling is enabled (drop frames to maintain source_fps / subsample_frames)
+        if self._min_interval is not None:
+            now = time.perf_counter()
+            if (now - self._last_process_time) < self._min_interval:
+                return
         if not self._process_lock.acquire(blocking=False):
             self.get_logger().debug("Skipping frame — previous frame still processing")
             return
@@ -468,6 +496,8 @@ class HUIPredNode(Node):
             self._process_lock.release()
 
     def _process_frame_locked(self, bgr: np.ndarray, depth_image: np.ndarray):
+        if self._min_interval is not None:
+            self._last_process_time = time.perf_counter()
         t_start = time.perf_counter()
         t_ip = 0.0
         args = self._args
@@ -638,6 +668,8 @@ def main(args=None):
                         help="Depth scale factor (depth units per meter, e.g. 1000 for mm)")
     parser.add_argument("--backprojection", "-bp", action="store_true", default=False,
                         help="Backproject joints from perspective to equirect before IP inference")
+    parser.add_argument("--source_fps", type=float, default=15.0,
+                        help="Assumed source/camera FPS; target FPS = source_fps / subsample_frames (from IP config)")
     parser.add_argument("--debug", "-d", action="store_true", default=False,
                         help="Save debug frames")
     parsed_args, ros_args = parser.parse_known_args(args)
