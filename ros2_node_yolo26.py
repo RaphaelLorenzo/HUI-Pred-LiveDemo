@@ -399,6 +399,10 @@ class HUIPredNode(Node):
             subsample_frames = self.ip_config["subsample_frames"]
             target_fps = args.source_fps / subsample_frames
             self._min_interval = 1.0 / target_fps if target_fps > 0 else 0.0
+            
+            # add a tolereance
+            self._min_interval = 0.9 * self._min_interval
+            
             self.get_logger().info(
                 f"Subsample frames={subsample_frames} -> target FPS={target_fps:.1f} (min_interval={self._min_interval*1000:.0f}ms)"
             )
