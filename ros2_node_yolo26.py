@@ -432,7 +432,7 @@ class HUIPredNode(Node):
         else:
             self.get_logger().info(f"Subscribing (RGB only): {rgb_topic}")
             self._sub_rgb = self.create_subscription(
-                CompressedImage, rgb_topic, self._rgb_only_cb, 10,
+                CompressedImage, rgb_topic, self._rgb_only_cb, 1,
             )
 
         self.get_logger().info("HUI-Pred node ready")
