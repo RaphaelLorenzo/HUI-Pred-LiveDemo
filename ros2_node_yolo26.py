@@ -399,13 +399,13 @@ class HUIPredNode(Node):
             subsample_frames = self.ip_config["subsample_frames"]
             target_fps = args.source_fps / subsample_frames
             self._min_interval = 1.0 / target_fps if target_fps > 0 else 0.0
-            self._last_process_time = 0.0
             self.get_logger().info(
                 f"Subsample frames={subsample_frames} -> target FPS={target_fps:.1f} (min_interval={self._min_interval*1000:.0f}ms)"
             )
         else:
             self._min_interval = None
-            self._last_process_time = 0.0
+            
+        self._last_processed_rgb_time = 0.0
 
         # -- State --
         self.track_history: dict = {}
@@ -488,23 +488,21 @@ class HUIPredNode(Node):
         if not self._process_lock.acquire(blocking=False):
             self.get_logger().info("Skipping frame — previous frame still processing")
             return
-
-        # Throttle to target FPS when subsampling is enabled (drop frames to maintain source_fps / subsample_frames)        
-        if self._min_interval is not None:
-            now = time.perf_counter()
-            if (now - self._last_process_time) < self._min_interval:
-                self.get_logger().info(f"Skipping frame — not enough time has passed (time difference: {now - self._last_process_time:.4f}s)")
-                self._process_lock.release()
-                return
-            
+        
         try:
+            time_elapsed = time.perf_counter() - self._last_processed_rgb_time            
+            if self._min_interval is not None:
+                if time_elapsed < self._min_interval:
+                    self.get_logger().info(f"Skipping frame — not enough time has passed since last processed message (time difference: {time_elapsed:.4f}s)")
+                    return
+                else:
+                    self.get_logger().info(f"Processed frame — time difference is enough: {time_elapsed:.4f}s. Will process and reset last processed time.")
+                    self._last_processed_rgb_time = time.perf_counter()
             self._process_frame_locked(bgr, depth_image)
         finally:
             self._process_lock.release()
 
     def _process_frame_locked(self, bgr: np.ndarray, depth_image: np.ndarray):
-        if self._min_interval is not None:
-            self._last_process_time = time.perf_counter()
         t_start = time.perf_counter()
         t_ip = 0.0
         args = self._args
