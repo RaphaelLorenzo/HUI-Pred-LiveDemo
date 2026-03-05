@@ -485,15 +485,16 @@ class HUIPredNode(Node):
 
     def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray):
         
-        # Throttle to target FPS when subsampling is enabled (drop frames to maintain source_fps / subsample_frames)
         if not self._process_lock.acquire(blocking=False):
             self.get_logger().info("Skipping frame — previous frame still processing")
             return
-        
+
+        # Throttle to target FPS when subsampling is enabled (drop frames to maintain source_fps / subsample_frames)        
         if self._min_interval is not None:
             now = time.perf_counter()
             if (now - self._last_process_time) < self._min_interval:
                 self.get_logger().info(f"Skipping frame — not enough time has passed (time difference: {now - self._last_process_time:.2f}s)")
+                self._process_lock.release()
                 return
             
         try:
