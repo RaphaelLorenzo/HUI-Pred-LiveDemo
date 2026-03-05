@@ -54,11 +54,11 @@ from utils.other_utils import read_yaml_to_dic
 # ---------------------------------------------------------------------------
 # Behavior prototype thresholds
 # ---------------------------------------------------------------------------
-INITIAL_INTERACTION_PREDICTION_THRESHOLD = 0.1
+INITIAL_INTERACTION_PREDICTION_THRESHOLD = 0.2
 INITIAL_MIN_FRAMES_ENGAGED = 2
 BREAKUP_FRAMES_DISENGAGED = 10
-MIN_LIGHTS_SCALE_THRESHOLD = 0.1
-MAX_LIGHTS_SCALE_THRESHOLD = 0.8
+MIN_EYES_SCALE_THRESHOLD = 0.1
+MAX_EYES_SCALE_THRESHOLD = 0.8
 
 COCO_SKELETON = [
     [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
@@ -422,6 +422,8 @@ class HUIPredNode(Node):
         self._pub_overlay = self.create_publisher(
             CompressedImage, "/huipred/overlay/compressed", 10
         )
+        self._overlay_mode = args.overlay_mode
+        self.get_logger().info(f"Overlay mode: {self._overlay_mode}")
 
         # -- Subscribers --
         if self._use_depth:
@@ -468,6 +470,125 @@ class HUIPredNode(Node):
 
         buf = np.frombuffer(raw, dtype=np.uint8)
         return cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+
+    # ----- overlay / eye animation builders -----------------------------------
+
+    def _build_overlay_image(
+        self,
+        bgr: np.ndarray,
+        current_track_ids: list,
+        boxes: np.ndarray,
+        keypoints_all: np.ndarray,
+        scores_all: np.ndarray,
+    ) -> np.ndarray:
+        """Build the camera image with bbox, skeleton, and IP score overlay."""
+        overlay = bgr.copy()
+        args = self._args
+        for i, tid_raw in enumerate(current_track_ids):
+            tid = int(tid_raw)
+            label = f"ID:{tid}"
+            ip_score = None
+            if tid in self.track_history and self.track_history[tid]["ip_output"]:
+                v = self.track_history[tid]["ip_output"][-1]
+                if isinstance(v, (int, float)):
+                    label += f" IP:{v:.2f}"
+                    ip_score = v
+                else:
+                    label += f" {v}"
+                    ip_score = 0.0
+            color = (0, 0, 255)
+            if ip_score is not None:
+                v = max(0.0, min(1.0, float(ip_score)))
+                red = int(255 * (1.0 - v))
+                green = int(255 * v)
+                color = (0, green, red)
+            x1, y1, x2, y2 = boxes[i].astype(int)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 8)
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            font_scale = 3.5
+            thickness = 10
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (text_width, text_height), base_line = cv2.getTextSize(label, font, font_scale, thickness)
+            text_org = (center_x - text_width // 2, center_y + text_height // 2)
+            cv2.putText(overlay, label, text_org, font, font_scale, color, thickness)
+            kp = keypoints_all[i]
+            sc = scores_all[i]
+            for j, k in COCO_SKELETON:
+                if sc[j] > args.kp_thresh and sc[k] > args.kp_thresh:
+                    pt1 = tuple(kp[j].astype(int))
+                    pt2 = tuple(kp[k].astype(int))
+                    cv2.line(overlay, pt1, pt2, color, 2)
+            for kp_pt, score in zip(kp, sc):
+                if score > args.kp_thresh:
+                    cv2.circle(overlay, (int(kp_pt[0]), int(kp_pt[1])), 4, color, -1)
+        return overlay
+
+    @staticmethod
+    def _build_eye_animation_image(
+        height: int,
+        width: int,
+        ip_score: float | None,
+        box_xyxy: np.ndarray | None,
+    ) -> np.ndarray:
+        """Build a synthetic eye animation driven by highest-IP person.
+
+        Openness: closed below MIN_EYES_SCALE_THRESHOLD, full open above MAX_EYES_SCALE_THRESHOLD.
+        Gaze: eyes point at box position in frame. Color: light red -> pop green.
+        No face, only two eyes; gap between eyes = 0.1 * image width.
+        """
+        out = np.zeros((height, width, 3), dtype=np.uint8)
+        out[:] = (0, 0, 0)  # transparent when blended so only eyes show
+        cx, cy = width // 2, height // 2
+        half_gap = int(0.05 * width)  # gap between eyes = 0.1 * width
+        eye_w = int(0.18 * width)
+        eye_h_base = max(2, int(0.48 * height))
+        pupil_radius = max(2, eye_w // 5)
+        max_pupil_offset = eye_w // 2
+        left_eye_cx = cx - half_gap - eye_w
+        right_eye_cx = cx + half_gap + eye_w
+        eye_cy = cy
+        if ip_score is None:
+            openness = 0.1
+        else:
+            s = float(ip_score)
+            if s <= MIN_EYES_SCALE_THRESHOLD:
+                openness = 0.1
+            elif s >= MAX_EYES_SCALE_THRESHOLD:
+                openness = 1.0
+            else:
+                openness = (s - MIN_EYES_SCALE_THRESHOLD) / (
+                    MAX_EYES_SCALE_THRESHOLD - MIN_EYES_SCALE_THRESHOLD
+                )
+        if box_xyxy is not None:
+            bx = (box_xyxy[0] + box_xyxy[2]) / 2.0
+            by = (box_xyxy[1] + box_xyxy[3]) / 2.0
+            gaze_x = (bx / width - 0.5) * 2.0
+            gaze_y = (by / height - 0.5) * 2.0
+        else:
+            gaze_x = gaze_y = 0.0
+        gaze_x = max(-1.0, min(1.0, gaze_x))
+        gaze_y = max(-1.0, min(1.0, gaze_y))
+        pupil_dx = int(gaze_x * max_pupil_offset)
+        pupil_dy = int(gaze_y * max_pupil_offset)
+        if ip_score is None:
+            t = 0.0
+        else:
+            t = max(0.0, min(1.0, float(ip_score)))
+        b, g, r = int(255 - t * 155), int(200 + t * 55), int(255 - t * 255)
+        eye_color = (b, g, r)
+        for ex in (left_eye_cx, right_eye_cx):
+            if openness <= 0.0:
+                cv2.line(out, (ex - eye_w, eye_cy), (ex + eye_w, eye_cy), eye_color, 2)
+            else:
+                eh = max(1, int(eye_h_base * openness))
+                cv2.ellipse(out, (ex, eye_cy), (eye_w, eh), 0, 0, 360, eye_color, -1)
+                cv2.ellipse(out, (ex, eye_cy), (eye_w, eh), 0, 0, 360, (200, 200, 200), 1)
+            pupil_x = max(ex - eye_w + pupil_radius, min(ex + eye_w - pupil_radius, ex + pupil_dx))
+            pupil_y = max(eye_cy - eye_h_base + pupil_radius,
+                         min(eye_cy + eye_h_base - pupil_radius, eye_cy + pupil_dy))
+            cv2.circle(out, (pupil_x, pupil_y), pupil_radius, (30, 30, 30), -1)
+        return out
 
     # ----- callbacks ----------------------------------------------------------
 
@@ -593,63 +714,37 @@ class HUIPredNode(Node):
                 for tid, val in ip_dict.items():
                     self.track_history[tid]["ip_output"].append(val)
 
-        # -- Draw overlay and publish annotated image --
-        overlay = bgr.copy()
-        for i, tid_raw in enumerate(current_track_ids):
-            tid = int(tid_raw)
-
-            label = f"ID:{tid}"
-            if tid in self.track_history and self.track_history[tid]["ip_output"]:
-                v = self.track_history[tid]["ip_output"][-1]
-                ip_score = None
-                if isinstance(v, (int, float)):
-                    label += f" IP:{v:.2f}"
-                    ip_score = v
-                else:
-                    label += f" {v}"
-                    ip_score = 0.0
-
-            # color = get_track_color(tid)
-            # Make a color from red (0.0) to green (1.0) based on ip_score value
-            color = (0, 0, 255)  # default to red (BGR), fallback if no ip_score
-            if 'ip_score' in locals() and ip_score is not None:
-                # Clamp ip_score within [0.0, 1.0]
-                v = max(0.0, min(1.0, float(ip_score)))
-                # Interpolate: green = v, red = 1-v (BGR format)
-                red = int(255 * (1.0 - v))
-                green = int(255 * v)
-                color = (0, green, red)
-            x1, y1, x2, y2 = boxes[i].astype(int)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 8)
-                    
-            # Calculate center position of the bounding box
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
-            font_scale = 3.5  # 5 times as big as original 0.5
-            thickness = 10
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            # Get text size
-            (text_width, text_height), base_line = cv2.getTextSize(label, font, font_scale, thickness)
-            # Calculate position so that text is centered
-            text_org = (center_x - text_width // 2, center_y + text_height // 2)
-            cv2.putText(overlay, label, text_org, font, font_scale, color, thickness)
-
-            kp = keypoints_all[i]
-            sc = scores_all[i]
-            for j, k in COCO_SKELETON:
-                if sc[j] > args.kp_thresh and sc[k] > args.kp_thresh:
-                    pt1 = tuple(kp[j].astype(int))
-                    pt2 = tuple(kp[k].astype(int))
-                    cv2.line(overlay, pt1, pt2, color, 2)
-            for kp_pt, score in zip(kp, sc):
-                if score > args.kp_thresh:
-                    cv2.circle(overlay, (int(kp_pt[0]), int(kp_pt[1])), 4, color, -1)
+        # -- Build output image and publish --
+        h, w = bgr.shape[:2]
+        if self._overlay_mode == "overlay":
+            img = self._build_overlay_image(
+                bgr, current_track_ids, boxes, keypoints_all, scores_all
+            )
+        else:
+            best_ip_score = None
+            best_box = None
+            if len(current_track_ids) > 0:
+                best_score = -1.0
+                best_idx = 0
+                for i, tid_raw in enumerate(current_track_ids):
+                    tid = int(tid_raw)
+                    if tid in self.track_history and self.track_history[tid]["ip_output"]:
+                        v = self.track_history[tid]["ip_output"][-1]
+                        if isinstance(v, (int, float)) and v > best_score:
+                            best_score = v
+                            best_idx = i
+                if best_score >= 0:
+                    best_ip_score = best_score
+                    best_box = boxes[best_idx]
+            eye_img = self._build_eye_animation_image(h, w, best_ip_score, best_box)
+            # Composite eye animation above base image at 60% opacity
+            img = cv2.addWeighted(eye_img, 0.8, bgr, 0.2, 0)
 
         img_msg = CompressedImage()
         img_msg.header.stamp = self.get_clock().now().to_msg()
         img_msg.header.frame_id = "camera_optical_frame"
         img_msg.format = "jpeg"
-        img_msg.data = np.array(cv2.imencode(".jpg", overlay)[1]).tobytes()
+        img_msg.data = np.array(cv2.imencode(".jpg", img)[1]).tobytes()
         self._pub_overlay.publish(img_msg)
 
         t_total = time.perf_counter() - t_start
@@ -685,6 +780,9 @@ def main(args=None):
                         help="Assumed source/camera FPS; target FPS = source_fps / subsample_frames (from IP config)")
     parser.add_argument("--debug", "-d", action="store_true", default=False,
                         help="Save debug frames")
+    parser.add_argument("--overlay_mode", type=str, choices=["overlay", "eye_animation"],
+                        default="overlay",
+                        help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person")
     parsed_args, ros_args = parser.parse_known_args(args)
 
     rclpy.init(args=ros_args)
