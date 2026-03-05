@@ -20,6 +20,7 @@ if [ "$IsRunning" -eq "0" ]; then
         -v $DIR:$DIR \
         -v /home:/home \
         -v /mnt:/mnt \
+        -v /media:/media \
         -v /tmp/.X11-unix:/tmp/.X11-unix \
         -v /tmp:/tmp \
         -e DISPLAY=${DISPLAY} \
