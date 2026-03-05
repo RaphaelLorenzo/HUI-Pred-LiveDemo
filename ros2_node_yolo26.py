@@ -528,8 +528,8 @@ class HUIPredNode(Node):
     def _build_eye_animation_image(
         height: int,
         width: int,
-        ip_score: float | None,
-        box_xyxy: np.ndarray | None,
+        ip_score: float,
+        box_xyxy: np.ndarray,
     ) -> np.ndarray:
         """Build a synthetic eye animation driven by highest-IP person.
 
