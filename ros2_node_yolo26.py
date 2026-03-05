@@ -406,6 +406,7 @@ class HUIPredNode(Node):
             self._min_interval = None
             
         self._last_processed_rgb_time = 0.0
+        self._last_received_rgb_time = 0.0
 
         # -- State --
         self.track_history: dict = {}
@@ -475,6 +476,9 @@ class HUIPredNode(Node):
         self._process_frame(bgr, depth)
 
     def _rgb_only_cb(self, rgb_msg: CompressedImage):
+        time_elapsed = time.perf_counter() - self._last_received_rgb_time
+        self._last_received_rgb_time = time.perf_counter()
+        self.get_logger().info(f"Just for info : received RGB message after {time_elapsed:.4f}s since last message")
         bgr = self._decode_compressed_rgb(rgb_msg)
         if bgr is None:
             self.get_logger().warn("Failed to decode RGB message")
