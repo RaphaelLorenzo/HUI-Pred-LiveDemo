@@ -124,6 +124,8 @@ def load_model_from_config(config: dict, device: torch.device):
         assert config["select_input_range"] == [0, -1], "select_input_range must be [0, -1] for live interaction prediction"
     
     sequence_length = config["input_length_in_frames"] // config["subsample_frames"]
+    
+    print(f"Input length in frames: {config['input_length_in_frames']} | Sequence length: {sequence_length} | Subsampling frames: {config['subsample_frames']}")
 
     # Subsampling is handled by running the pipeline at target_fps = source_fps / subsample_frames
     # (frame dropping in the ROS node); no need to restrict model loading here.
