@@ -569,7 +569,8 @@ class HUIPredNode(Node):
             gaze_x = gaze_y = 0.0
         gaze_x = max(-1.0, min(1.0, gaze_x))
         gaze_y = max(-1.0, min(1.0, gaze_y))
-        pupil_dx = int(gaze_x * max_pupil_offset)
+        # Invert horizontal gaze for screen/mirrored display
+        pupil_dx = int(-gaze_x * max_pupil_offset)
         pupil_dy = int(gaze_y * max_pupil_offset)
         if ip_score is None:
             t = 0.0
