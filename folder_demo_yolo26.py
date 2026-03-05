@@ -128,12 +128,13 @@ def load_model_from_config(config: dict, device: torch.device) -> torch.nn.Modul
     
     print(f"Input dimension: {input_dim} | Data columns: {data_columns}")
 
-    if "select_input_range" in config and config["select_input_range"] != [[0,-1]]:
-        sequence_length = config["select_input_range"][1] - config["select_input_range"][0]
-    else:
-        sequence_length = config["input_length_in_frames"] // config["subsample_frames"]
+    # assume we always have select_input_range = [0, -1]
+    if "select_input_range" in config:
+        assert config["select_input_range"] == [0, -1], "select_input_range must be [0, -1] for live interaction prediction"
     
-    assert(config["subsample_frames"] == 1), "Subsampling frames is not supported for live interaction prediction"
+    sequence_length = config["input_length_in_frames"] // config["subsample_frames"]
+    
+    print(f"length of sequence : {sequence_length} | subsampling frames  {config['subsample_frames']}")
     
     # Instantiate model
     if config["force_model_type"] == "mlp":
@@ -372,7 +373,7 @@ def backproject_points_to_equirect(
 _backproj_debug_frame = None
 
 
-def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict, current_tracks_history: dict, device: torch.device, image_size: tuple, backprojection: bool = False) -> np.ndarray:
+def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict, input_length_in_frames: int, min_frames_inference: int, current_tracks_history: dict, device: torch.device, image_size: tuple, backprojection: bool = False) -> np.ndarray:
     """
     Perform inference on the ActionNet model.
     
@@ -386,8 +387,13 @@ def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict
     assert(config["mb_input_norm"] == "vid"), "Only video normalization is supported for live interaction prediction"
     
     min_valid_keypoints = config["min_keypoints_filter"]
-    input_length_in_frames = 16 #config["input_length_in_frames"]
+    
     max_index_gap_allowed = 2
+
+    # IMPORTANT: keep YOLO running at full rate; only subsample frames here for
+    # the interaction prediction model's temporal filtering / input preparation.
+    subsample_frames = int(config.get("subsample_frames", 1))
+    subsample_frames = max(1, subsample_frames)
     
     # Target size for normalization
     eq_w, eq_h = (3840, 1920) if backprojection else image_size
@@ -401,17 +407,32 @@ def action_net_inference(args: argparse.Namespace, model: ActionNet, config:dict
     for track_id, track_history in current_tracks_history.items():
         indexes = track_history["indexes"]
         input_tensors = track_history["ip_input_tensor"]
-        if len(indexes) < input_length_in_frames:
+        if len(indexes) < min_frames_inference:
             return_dict[track_id] = "not_enough_frames"
             continue
-        
-        last_indexes = np.array(indexes[-input_length_in_frames:]) # T
+
+        # Determine the exact raw window needed to feed the model after subsampling.
+        # The model's expected temporal length is floor(input_length_in_frames / subsample_frames)
+        # when subsampling is enabled.
+        expected_T = input_length_in_frames if subsample_frames == 1 else (input_length_in_frames // subsample_frames)
+        raw_window = expected_T * subsample_frames
+        if expected_T <= 0 or len(indexes) < raw_window:
+            return_dict[track_id] = "not_enough_frames"
+            continue
+
+        # Subsample only for the ActionNet input preparation.
+        last_indexes = np.array(indexes[-raw_window:])[::subsample_frames]  # T
         last_indexes_gap = np.diff(last_indexes) # T-1
-        if np.any(last_indexes_gap > max_index_gap_allowed):
+        allowed_gap = max_index_gap_allowed * subsample_frames
+        if np.any(last_indexes_gap > allowed_gap):
             return_dict[track_id] = "index_gap_too_large"
             continue
         
-        last_input_tensors = input_tensors[-input_length_in_frames:]
+        last_input_tensors = input_tensors[-raw_window:][::subsample_frames]
+        if len(last_input_tensors) != expected_T:
+            # Be strict: mismatch means temporal alignment is off (e.g. config mismatch).
+            return_dict[track_id] = "sequence_length_mismatch"
+            continue
         last_input_tensors = torch.stack(last_input_tensors, dim=0) # T, 17, 3
         last_input_scores = last_input_tensors[:, :, 2] # T, 17
         last_input_valid_joints = (last_input_scores > args.kp_thresh).sum(dim=1) # T
@@ -653,6 +674,20 @@ def process_input(args: argparse.Namespace) -> dict:
                 raise NotImplementedError(f"Model type {type(ip_model).__name__} not supported for live interaction prediction for now")
             
             print(f"Loaded model of type {type(ip_model).__name__} and weights from checkpoint")    
+
+        # Determine the minimum number of raw frames required before running IP inference.
+        # This is based on the input length used at model loading time.
+        if "select_input_range" in ip_config:
+            assert ip_config["select_input_range"] == [0, -1], "select_input_range must be [0, -1] for live interaction prediction"
+        
+        input_length_in_frames = int(ip_config["input_length_in_frames"]) # raw input length, before subsampling
+
+        # For ActionNet models, allow running with half the required temporal context.
+        # For other models, require the full window.
+        if isinstance(ip_model, ActionNet):
+            min_frames_inference = max(1, input_length_in_frames // 2)
+        else:
+            min_frames_inference = input_length_in_frames
     
     # Initialize info panel for display and/or save
     info_panel = InfoPanel(
@@ -752,6 +787,8 @@ def process_input(args: argparse.Namespace) -> dict:
                 ip_dict = action_net_inference(args, 
                                                      ip_model, 
                                                      ip_config, 
+                                                     input_length_in_frames,
+                                                     min_frames_inference,
                                                      current_tracks_history, 
                                                      device=torch.device("cuda"), 
                                                      image_size=(image.width, image.height),
