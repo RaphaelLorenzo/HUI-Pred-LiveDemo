@@ -724,7 +724,12 @@ class HUIPredNode(Node):
                     self.track_history[tid]["ip_output"].append(val)
                     history_length = len(self.track_history[tid]["ip_output"])
                     last_ip_outputs = self.track_history[tid]["ip_output"][-min(3,history_length):]
-                    last_ip_outputs_filtered = [float(v) for v in last_ip_outputs if isinstance(v, (int, float, np.floating)) else 0.0]
+                    last_ip_outputs_filtered = []
+                    for v in last_ip_outputs:
+                        if isinstance(v, (int, float, np.floating)):
+                            last_ip_outputs_filtered.append(float(v))
+                        else:
+                            last_ip_outputs_filtered.append(0.0)
                     print(f"last_ip_outputs_filtered: {last_ip_outputs_filtered}")
                     self.track_history[tid]["ip_output_filtered"].append(float(np.mean(np.array(last_ip_outputs_filtered)))) # mean of last 3 ip outputs
 
