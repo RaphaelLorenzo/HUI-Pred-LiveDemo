@@ -793,7 +793,7 @@ class HUIPredNode(Node):
                     if isinstance(v, (int, float, np.floating)):
                         ip_out_f = float(v)
 
-            tracks_data.extend([h, w, x1, y1, x2, y2, conf, depth, ip_out, ip_out_f])
+            tracks_data.extend([float(h), float(w), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f])
 
         tracks_msg.data = tracks_data
         self._pub_tracks.publish(tracks_msg)
