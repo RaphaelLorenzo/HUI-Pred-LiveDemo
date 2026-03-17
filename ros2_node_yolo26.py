@@ -740,7 +740,7 @@ class HUIPredNode(Node):
             img = self._build_overlay_image(
                 bgr, current_track_ids, boxes, keypoints_all, scores_all
             )
-        else:
+        elif self._overlay_mode == "eye_animation":
             best_ip_score = None
             best_box = None
             if len(current_track_ids) > 0:
@@ -760,12 +760,20 @@ class HUIPredNode(Node):
             # Composite eye animation above base image at 60% opacity
             img = cv2.addWeighted(eye_img, 0.8, bgr, 0.2, 0)
 
-        img_msg = CompressedImage()
-        img_msg.header.stamp = self.get_clock().now().to_msg()
-        img_msg.header.frame_id = "camera_optical_frame"
-        img_msg.format = "jpeg"
-        img_msg.data = np.array(cv2.imencode(".jpg", img)[1]).tobytes()
-        self._pub_overlay.publish(img_msg)
+        elif self._overlay_mode == "nodrawing":
+            img = None
+
+        else:
+            self.get_logger().error(f"Invalid overlay mode: {self._overlay_mode}")
+            return
+
+        if img is not None:
+            img_msg = CompressedImage()
+            img_msg.header.stamp = self.get_clock().now().to_msg()
+            img_msg.header.frame_id = "camera_optical_frame"
+            img_msg.format = "jpeg"
+            img_msg.data = np.array(cv2.imencode(".jpg", img)[1]).tobytes()
+            self._pub_overlay.publish(img_msg)
 
         tracks_msg = Float32MultiArray()
         tracks_data = []
@@ -832,9 +840,9 @@ def main(args=None):
                         help="Assumed source/camera FPS; target FPS = source_fps / subsample_frames (from IP config)")
     parser.add_argument("--debug", "-d", action="store_true", default=False,
                         help="Save debug frames")
-    parser.add_argument("--overlay_mode", type=str, choices=["overlay", "eye_animation"],
+    parser.add_argument("--overlay_mode", "-om", type=str, choices=["overlay", "eye_animation", "nodrawing"],
                         default="overlay",
-                        help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person")
+                        help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person; 'nodrawing' = no drawing and no publishing of image")
     parsed_args, ros_args = parser.parse_known_args(args)
 
     rclpy.init(args=ros_args)

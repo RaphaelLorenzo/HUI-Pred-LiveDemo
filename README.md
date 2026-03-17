@@ -15,7 +15,7 @@ python folder_demo_yolo26.py
 ```
 docker build -t huipreddemo_jetson:latest .
 sh run_docker.sh
-python ros2_node_yolo26.py
+python ros2_node_yolo26.py -bp -ip ./checkpoints/converted_mb_FineTuned_SingleImage_05_03_26_best_adaptative_f1/ --overlay_mode nodrawing
 ```
 
 ## List of sequences per location for testing
