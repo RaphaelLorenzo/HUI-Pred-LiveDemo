@@ -3,10 +3,19 @@ Live end-to-end demonstration of Human-Robot interaction anticipation
 
 ## Installation
 
+- Locally using `conda` with pre-recorded data (images, videos, episodes...)
 ```
 conda create --name huilive python=3.10
 conda activate huilive
 pip install -r requirements.txt
+python folder_demo_yolo26.py
+```
+
+- On jetson using `docker` (with a ROS2 node subscribing to )
+```
+docker build -t huipreddemo_jetson:latest .
+sh run_docker.sh
+python ros2_node_yolo26.py
 ```
 
 ## List of sequences per location for testing
@@ -26,4 +35,37 @@ When using `-ed` option for input
     - "AlbeeSquare": ["2023_07_06_albee_square_landfill_0","2023_07_06_albee_square_landfill_1","2023_07_06_albee_square_recycle_0","2023_07_06_albee_square_recycle_1","2023_07_07_albee_square_landfill_0","2023_07_07_albee_square_landfill_1","2023_07_07_albee_square_recycle_0","2023_07_07_albee_square_recycle_1","2023_07_11_albee_square_landfill_0","2023_07_11_albee_square_landfill_1","2023_07_11_albee_square_recycle_0","2023_07_11_albee_square_recycle_1","2023_07_12_albee_square_landfill_0","2023_07_12_albee_square_landfill_1","2023_07_12_albee_square_recycle_0","2023_07_12_albee_square_recycle_1","2023_07_14_albee_square_landfill","2023_07_14_albee_square_recycle"]
 ```
 
-Testng sequences are in  `EntranceCFacing`, `Room104` and `AlbeeSquare`
+Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
+
+## ROS2 node topics
+
+### Input
+
+- `/camera/color/image_raw/compressed`  
+  **Type:** `sensor_msgs/msg/CompressedImage`  
+  **Description:** Main RGB camera stream (compressed image).
+
+- `/camera/aligned_depth_to_color/image_raw/compressed`  
+  **Type:** `sensor_msgs/msg/CompressedImage`  
+  **Description:** (Optional, if using depth) Depth image aligned to the color stream (compressed image).
+
+### Output
+
+- `/huilive_overlay/compressed`  
+  **Type:** `sensor_msgs/msg/CompressedImage`  
+  **Description:** The camera image overlaid with YOLO pose, predicted interaction, and other visualizations according to the overlay mode.
+
+- `/huilive_tracks`  
+  **Type:** `std_msgs/msg/Float32MultiArray`  
+  **Description:** Sequence of per-person tracking information for each detection in the current frame:  
+    `[image_height, image_width, x1, y1, x2, y2, box_confidence, depth, ip_output, ip_output_filtered]` (repeated for each track/person).  
+
+  - `x1, y1, x2, y2`: Bounding box coordinates (float)  
+  - `box_confidence`: YOLO box confidence score  
+  - `depth`: Estimated depth (or -1.0 if unavailable)  
+  - `ip_output`: Latest interaction prediction output for this track  
+  - `ip_output_filtered`: Filtered/averaged interaction prediction for temporal stability
+
+
+## Remarks
+For compatibily reasons the checkpoints containing config and `state_dict` must be separated using `convert_checkpoints.py` before running using the jetson docker.

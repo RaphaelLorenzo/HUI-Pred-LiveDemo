@@ -4,6 +4,12 @@ import argparse
 import os
 
 
+"""
+Convert a checkpoint to a separate file for state_dict and config (compatible with older pytorch versions)
+Usage:
+    python convert_checkpoints.py --input_path <input_path>
+"""
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_path", "-ip", type=str, required=True)

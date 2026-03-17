@@ -8,3 +8,4 @@ __pycache__
 output/videos/
 debug/
 frame_000146.jpg
+runs*
