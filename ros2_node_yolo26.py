@@ -22,6 +22,7 @@ from functools import partial
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Float32MultiArray
 import message_filters
 
 
@@ -422,6 +423,12 @@ class HUIPredNode(Node):
         self._pub_overlay = self.create_publisher(
             CompressedImage, "/huipred/overlay/compressed", 10
         )
+
+        # -- Publisher: /huipred/tracks (flat float array; 8 floats per track) --
+        # Per track: [x1, y1, x2, y2, conf, depth(-1 if none), ip_output(-1 if none), ip_output_filtered(-1 if none)]
+        self._pub_tracks = self.create_publisher(
+            Float32MultiArray, "/huipred/tracks", 10
+        )
         self._overlay_mode = args.overlay_mode
         self.get_logger().info(f"Overlay mode: {self._overlay_mode}")
 
@@ -686,6 +693,7 @@ class HUIPredNode(Node):
                     self.track_history[tid] = {
                         "detections": [], "poses": [],
                         "ip_input_tensor": [], "indexes": [], "ip_output": [],
+                        "ip_output_filtered": []
                     }
                 self.track_history[tid]["detections"].append({
                     "frame": self.frame_idx,
@@ -714,6 +722,9 @@ class HUIPredNode(Node):
                 t_ip = time.perf_counter() - t_ip_s
                 for tid, val in ip_dict.items():
                     self.track_history[tid]["ip_output"].append(val)
+                    history_length = len(self.track_history[tid]["ip_output"])
+                    last_ip_outputs = self.track_history[tid]["ip_output"][-min(3,history_length):]
+                    self.track_history[tid]["ip_output_filtered"].append(float(np.mean(np.array(last_ip_outputs)))) # mean of last 3 ip outputs
 
         # -- Build output image and publish --
         h, w = bgr.shape[:2]
@@ -747,6 +758,38 @@ class HUIPredNode(Node):
         img_msg.format = "jpeg"
         img_msg.data = np.array(cv2.imencode(".jpg", img)[1]).tobytes()
         self._pub_overlay.publish(img_msg)
+
+        tracks_msg = Float32MultiArray()
+        tracks_data = []
+        for i, tid_raw in enumerate(current_track_ids):
+            tid = int(tid_raw)
+
+            # bbox + conf
+            x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
+            conf = float(confs[i]) if len(confs) else -1.0
+
+            # depth
+            depth = -1.0
+            if i < len(depths) and depths[i] is not None:
+                depth = float(depths[i])
+
+            # IP outputs
+            ip_out = -1.0
+            ip_out_f = -1.0
+            if tid in self.track_history:
+                if self.track_history[tid].get("ip_output"):
+                    v = self.track_history[tid]["ip_output"][-1]
+                    if isinstance(v, (int, float, np.floating)):
+                        ip_out = float(v)
+                if self.track_history[tid].get("ip_output_filtered"):
+                    v = self.track_history[tid]["ip_output_filtered"][-1]
+                    if isinstance(v, (int, float, np.floating)):
+                        ip_out_f = float(v)
+
+            tracks_data.extend([x1, y1, x2, y2, conf, depth, ip_out, ip_out_f])
+
+        tracks_msg.data = tracks_data
+        self._pub_tracks.publish(tracks_msg)
 
         t_total = time.perf_counter() - t_start
         self.get_logger().info(
