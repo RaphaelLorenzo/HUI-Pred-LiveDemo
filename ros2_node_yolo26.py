@@ -763,7 +763,8 @@ class HUIPredNode(Node):
                     "frame": self.frame_idx,
                     "bbox": boxes[i].tolist(),
                     "conf": float(confs[i]),
-                    **({"depth": depths[i]} if depths[i] is not None else {}),
+                    "depth": depths[i] if depths[i] is not None else None,
+                    # **({"depth": depths[i]} if depths[i] is not None else {}),
                 })
                 self.track_history[tid]["poses"].append({
                     "frame": self.frame_idx,
