@@ -731,7 +731,7 @@ class HUIPredNode(Node):
                             last_ip_outputs_filtered.append(float(v))
                         else:
                             last_ip_outputs_filtered.append(0.0)
-                    print(f"last_ip_outputs_filtered: {last_ip_outputs_filtered}")
+                    print(f"Track {tid}  | last_ip_outputs_filtered: {[f'{v:.2f}' for v in last_ip_outputs_filtered]}")
                     self.track_history[tid]["ip_output_filtered"].append(float(np.mean(np.array(last_ip_outputs_filtered)))) # mean of last 3 ip outputs
 
         # -- Build output image and publish --
