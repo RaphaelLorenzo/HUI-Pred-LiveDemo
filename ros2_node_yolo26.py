@@ -485,7 +485,7 @@ class HUIPredNode(Node):
         return cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
 
     @staticmethod
-    def _decode_depth_image(msg: RosImage, logger: rclpy.logging.Logger):
+    def _decode_depth_image(msg: RosImage, logger):
         """Decode a raw sensor_msgs/Image depth message to numpy array.
 
         Supports common depth encodings:
