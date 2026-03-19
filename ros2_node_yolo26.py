@@ -417,6 +417,8 @@ class HUIPredNode(Node):
         
         # -- Current estimation mode --
         self.current_estimation_mode = args.default_estimation_mode
+        if self.current_estimation_mode == "depth_based":
+            assert(depth_topic != ""), "Depth topic is required for depth-based IP estimation"
         
         # -- IP estimation depth range --
         self.ip_estimation_depth_min = args.ip_estimation_depth_min
@@ -801,7 +803,7 @@ class HUIPredNode(Node):
                 for i, tid in enumerate(current_track_ids):
                     track_depth = self.track_history[tid]["detections"][-1]["depth"]
                     if track_depth is not None and track_depth > 0:
-                        estimated_ip = (track_depth - ip_estimation_depth_range[0]) / (ip_estimation_depth_range[1] - ip_estimation_depth_range[0])
+                        estimated_ip = (ip_estimation_depth_range[1] - track_depth) / (ip_estimation_depth_range[1] - ip_estimation_depth_range[0])
                         estimated_ip = max(0, min(1, estimated_ip))
                         print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from depth {track_depth:.2f}m")
                         self.track_history[tid]["ip_output"].append(estimated_ip)
