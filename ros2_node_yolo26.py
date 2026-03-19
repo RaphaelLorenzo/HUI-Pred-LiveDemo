@@ -349,6 +349,7 @@ class HUIPredNode(Node):
 
         rgb_topic = args.rgb_topic
         depth_topic = args.depth_topic or ""
+        self.depth_topic = depth_topic
         self.compressed_depth = "compressed" in depth_topic
         yolo_path = args.yolo_model_path
         ip_ckpt = args.interaction_prediction_checkpoint or ""
@@ -897,7 +898,8 @@ class HUIPredNode(Node):
             conf = float(confs[i]) if len(confs) else -1.0
 
             # depth
-            depth = -1.0
+            _depth_default_value = -1.0 if self.depth_topic != "" else -2.0
+            depth = _depth_default_value
             if depths[i] is not None:
                 depth = float(depths[i])
 
