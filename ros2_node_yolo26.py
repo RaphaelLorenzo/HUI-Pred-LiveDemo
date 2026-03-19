@@ -414,6 +414,13 @@ class HUIPredNode(Node):
             
         self._last_processed_rgb_time = 0.0
         self._last_received_rgb_time = 0.0
+        
+        # -- Current estimation mode --
+        self.current_estimation_mode = args.default_estimation_mode
+        
+        # -- IP estimation depth range --
+        self.ip_estimation_depth_min = args.ip_estimation_depth_min
+        self.ip_estimation_depth_max = args.ip_estimation_depth_max
 
         # -- State --
         self.track_history: dict = {}
@@ -765,7 +772,7 @@ class HUIPredNode(Node):
                 self.track_history[tid]["indexes"].append(self.frame_idx)
 
             # -- Interaction prediction --
-            if self.ip_model is not None:
+            if self.ip_model is not None and self.current_estimation_mode == "ip_inference":
                 t_ip_s = time.perf_counter()
                 cur = {int(t): self.track_history[int(t)] for t in current_track_ids}
                 ip_dict = action_net_inference(
@@ -789,6 +796,17 @@ class HUIPredNode(Node):
                     print(f"Track {tid}  | last_ip_outputs_filtered: {[f'{v:.2f}' for v in last_ip_outputs_filtered]}")
                     self.track_history[tid]["ip_output_filtered"].append(float(np.mean(np.array(last_ip_outputs_filtered)))) # mean of last 3 ip outputs
 
+            elif len(depths) > 0 and depths[0] is not None and self.current_estimation_mode == "depth_based":
+                ip_estimation_depth_range = [self.ip_estimation_depth_min, self.ip_estimation_depth_max] # linear mapping between 0 and 1 for IP, using as input depth scaled between min and max depth
+                for i, tid in enumerate(current_track_ids):
+                    track_depth = self.track_history[tid]["detections"][-1]["depth"]
+                    if track_depth is not None and track_depth > 0:
+                        estimated_ip = (track_depth - ip_estimation_depth_range[0]) / (ip_estimation_depth_range[1] - ip_estimation_depth_range[0])
+                        estimated_ip = max(0, min(1, estimated_ip))
+                        print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from depth {track_depth:.2f}m")
+                        self.track_history[tid]["ip_output"].append(estimated_ip)
+                        self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
+            
         # -- Build output image and publish --
         h, w = bgr.shape[:2]
         if self._overlay_mode == "overlay":
@@ -841,7 +859,7 @@ class HUIPredNode(Node):
 
             # depth
             depth = -1.0
-            if i < len(depths) and depths[i] is not None:
+            if depths[i] is not None:
                 depth = float(depths[i])
 
             # IP outputs
@@ -897,6 +915,13 @@ def main(args=None):
                         help="Save debug frames")
     parser.add_argument("--filter_length", type=int, default=3,
                         help="Filter length for IP output (mean of last N IP outputs)")
+    parser.add_argument("--ip_estimation_depth_min", "-ipdmin", type=float, default=1.0,
+                        help="Minimum depth for IP estimation (in meters) for depth-based IP estimation")
+    parser.add_argument("--ip_estimation_depth_max", "-ipdmax", type=float, default=3.0,
+                        help="Maximum depth for IP estimation (in meters) for depth-based IP estimation")
+    parser.add_argument("--default_estimation_mode", "-dem", type=str, choices=["ip_inference", "depth_based"],
+                        default="ip_inference",
+                        help="Default estimation mode: 'ip_inference' = use IP inference model; 'depth_based' = use depth-based IP estimation")
     parser.add_argument("--overlay_mode", "-om", type=str, choices=["overlay", "eye_animation", "nodrawing"],
                         default="overlay",
                         help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person; 'nodrawing' = no drawing and no publishing of image")
