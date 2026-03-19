@@ -917,9 +917,9 @@ def main(args=None):
                         help="Save debug frames")
     parser.add_argument("--filter_length", type=int, default=3,
                         help="Filter length for IP output (mean of last N IP outputs)")
-    parser.add_argument("--ip_estimation_depth_min", "-ipdmin", type=float, default=1.0,
+    parser.add_argument("--ip_estimation_depth_min", "-ipdmin", type=float, default=0.5,
                         help="Minimum depth for IP estimation (in meters) for depth-based IP estimation")
-    parser.add_argument("--ip_estimation_depth_max", "-ipdmax", type=float, default=3.0,
+    parser.add_argument("--ip_estimation_depth_max", "-ipdmax", type=float, default=2.5,
                         help="Maximum depth for IP estimation (in meters) for depth-based IP estimation")
     parser.add_argument("--default_estimation_mode", "-dem", type=str, choices=["ip_inference", "depth_based"],
                         default="ip_inference",
