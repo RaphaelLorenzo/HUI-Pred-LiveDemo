@@ -485,7 +485,7 @@ class HUIPredNode(Node):
         return cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
 
     @staticmethod
-    def _decode_depth_image(msg: RosImage):
+    def _decode_depth_image(msg: RosImage, logger: rclpy.logging.Logger):
         """Decode a raw sensor_msgs/Image depth message to numpy array.
 
         Supports common depth encodings:
@@ -504,6 +504,7 @@ class HUIPredNode(Node):
             dtype = np.dtype(np.float32)
             channels = 1
         else:
+            logger.warn(f"Unsupported depth encoding: {enc}")
             return None
 
         # Respect endianness from ROS message.
@@ -519,7 +520,8 @@ class HUIPredNode(Node):
                 return None
             arr = arr[:expected_pixels].reshape((msg.height, msg.width))
             return arr
-        except Exception:
+        except Exception as e:
+            logger.warn(f"Failed to decode depth image: {e}")
             return None
 
     # ----- overlay / eye animation builders -----------------------------------
@@ -652,7 +654,7 @@ class HUIPredNode(Node):
         if self.compressed_depth:
             depth = self._decode_compressed_depth(depth_msg)
         else:
-            depth = self._decode_depth_image(depth_msg)
+            depth = self._decode_depth_image(depth_msg, self.get_logger())
         if bgr is None:
             self.get_logger().warn("Failed to decode RGB message")
             return
