@@ -417,6 +417,7 @@ class HUIPredNode(Node):
         # -- State --
         self.track_history: dict = {}
         self.frame_idx = 0
+        self.filter_length = args.filter_length
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._process_lock = threading.Lock()
 
@@ -724,7 +725,8 @@ class HUIPredNode(Node):
                 for tid, val in ip_dict.items():
                     self.track_history[tid]["ip_output"].append(val)
                     history_length = len(self.track_history[tid]["ip_output"])
-                    last_ip_outputs = self.track_history[tid]["ip_output"][-min(3,history_length):]
+                    FILTER_LENGTH = self.filter_length
+                    last_ip_outputs = self.track_history[tid]["ip_output"][-min(FILTER_LENGTH,history_length):]
                     last_ip_outputs_filtered = []
                     for v in last_ip_outputs:
                         if isinstance(v, (int, float, np.floating)):
@@ -840,6 +842,8 @@ def main(args=None):
                         help="Assumed source/camera FPS; target FPS = source_fps / subsample_frames (from IP config)")
     parser.add_argument("--debug", "-d", action="store_true", default=False,
                         help="Save debug frames")
+    parser.add_argument("--filter_length", type=int, default=3,
+                        help="Filter length for IP output (mean of last N IP outputs)")
     parser.add_argument("--overlay_mode", "-om", type=str, choices=["overlay", "eye_animation", "nodrawing"],
                         default="overlay",
                         help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person; 'nodrawing' = no drawing and no publishing of image")
