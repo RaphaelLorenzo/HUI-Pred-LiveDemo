@@ -21,7 +21,7 @@ from functools import partial
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Image as RosImage
 from std_msgs.msg import Float32MultiArray
 import message_filters
 
@@ -349,6 +349,7 @@ class HUIPredNode(Node):
 
         rgb_topic = args.rgb_topic
         depth_topic = args.depth_topic or ""
+        self.compressed_depth = "compressed" in depth_topic
         yolo_path = args.yolo_model_path
         ip_ckpt = args.interaction_prediction_checkpoint or ""
         self._use_depth = depth_topic != ""
@@ -440,7 +441,10 @@ class HUIPredNode(Node):
                 f"Subscribing (synced): RGB={rgb_topic}  Depth={depth_topic}"
             )
             self._sub_rgb = message_filters.Subscriber(self, CompressedImage, rgb_topic)
-            self._sub_depth = message_filters.Subscriber(self, CompressedImage, depth_topic)
+            if self.compressed_depth:
+                self._sub_depth = message_filters.Subscriber(self, CompressedImage, depth_topic)
+            else:
+                self._sub_depth = message_filters.Subscriber(self, RosImage, depth_topic)
             self._sync = message_filters.ApproximateTimeSynchronizer(
                 [self._sub_rgb, self._sub_depth], queue_size=10, slop=0.1,
             )
@@ -479,6 +483,44 @@ class HUIPredNode(Node):
 
         buf = np.frombuffer(raw, dtype=np.uint8)
         return cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+
+    @staticmethod
+    def _decode_depth_image(msg: RosImage):
+        """Decode a raw sensor_msgs/Image depth message to numpy array.
+
+        Supports common depth encodings:
+        - 16UC1 / mono16 -> uint16 depth
+        - 32FC1 -> float32 depth
+        """
+        if msg.height == 0 or msg.width == 0:
+            return None
+
+        enc = (msg.encoding or "").lower()
+
+        if enc in ("16uc1", "mono16"):
+            dtype = np.dtype(np.uint16)
+            channels = 1
+        elif enc == "32fc1":
+            dtype = np.dtype(np.float32)
+            channels = 1
+        else:
+            return None
+
+        # Respect endianness from ROS message.
+        if msg.is_bigendian:
+            dtype = dtype.newbyteorder(">")
+        else:
+            dtype = dtype.newbyteorder("<")
+
+        try:
+            arr = np.frombuffer(msg.data, dtype=dtype)
+            expected_pixels = msg.height * msg.width * channels
+            if arr.size < expected_pixels:
+                return None
+            arr = arr[:expected_pixels].reshape((msg.height, msg.width))
+            return arr
+        except Exception:
+            return None
 
     # ----- overlay / eye animation builders -----------------------------------
 
@@ -607,7 +649,10 @@ class HUIPredNode(Node):
         self._last_received_rgb_time = time.perf_counter()
         self.get_logger().info(f"Just for info : received RGB message after {time_elapsed:.4f}s since last message")
         bgr = self._decode_compressed_rgb(rgb_msg)
-        depth = self._decode_compressed_depth(depth_msg)
+        if self.compressed_depth:
+            depth = self._decode_compressed_depth(depth_msg)
+        else:
+            depth = self._decode_depth_image(depth_msg)
         if bgr is None:
             self.get_logger().warn("Failed to decode RGB message")
             return
