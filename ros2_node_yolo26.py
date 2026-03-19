@@ -603,10 +603,16 @@ class HUIPredNode(Node):
     # ----- callbacks ----------------------------------------------------------
 
     def _synced_cb(self, rgb_msg: CompressedImage, depth_msg: CompressedImage):
+        time_elapsed = time.perf_counter() - self._last_received_rgb_time
+        self._last_received_rgb_time = time.perf_counter()
+        self.get_logger().info(f"Just for info : received RGB message after {time_elapsed:.4f}s since last message")
         bgr = self._decode_compressed_rgb(rgb_msg)
         depth = self._decode_compressed_depth(depth_msg)
         if bgr is None:
             self.get_logger().warn("Failed to decode RGB message")
+            return
+        if depth is None:
+            self.get_logger().warn("Failed to decode depth message")
             return
         self._process_frame(bgr, depth)
 
