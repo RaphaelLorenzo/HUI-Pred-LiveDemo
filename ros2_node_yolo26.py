@@ -22,7 +22,7 @@ from functools import partial
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, Image as RosImage
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 import message_filters
 
 
@@ -444,6 +444,20 @@ class HUIPredNode(Node):
         self._overlay_mode = args.overlay_mode
         self.get_logger().info(f"Overlay mode: {self._overlay_mode}")
 
+        # -- Subscriber: dynamic estimation mode switch --
+        # Expected values in msg.data:
+        # - "ip_inference"
+        # - "depth_based"
+        self._estimation_mode_sub = self.create_subscription(
+            String,
+            args.estimation_mode_topic,
+            self._estimation_mode_cb,
+            10,
+        )
+        self.get_logger().info(
+            f"Estimation mode topic: {args.estimation_mode_topic} (default={self.current_estimation_mode})"
+        )
+
         # -- Subscribers --
         if self._use_depth:
             self.get_logger().info(
@@ -681,6 +695,28 @@ class HUIPredNode(Node):
             self.get_logger().warn("Failed to decode RGB message")
             return
         self._process_frame(bgr, None)
+
+    # ----- dynamic estimation mode ------------------------------------------
+
+    def _estimation_mode_cb(self, msg: String):
+        new_mode = (msg.data or "").strip()
+        if new_mode not in ("ip_inference", "depth_based"):
+            self.get_logger().warn(
+                f"Ignoring invalid estimation mode '{new_mode}'. Expected 'ip_inference' or 'depth_based'."
+            )
+            return
+
+        if new_mode == self.current_estimation_mode:
+            return
+
+        old_mode = self.current_estimation_mode
+        self.current_estimation_mode = new_mode
+        self.get_logger().info(f"Switch estimation mode: {old_mode} -> {new_mode}")
+
+        # Clear per-track IP outputs so we don't mix results from a previous mode.
+        for tid, hist in self.track_history.items():
+            hist["ip_output"] = []
+            hist["ip_output_filtered"] = []
 
     # ----- main per-frame pipeline -------------------------------------------
 
@@ -928,6 +964,13 @@ def main(args=None):
     parser.add_argument("--overlay_mode", "-om", type=str, choices=["overlay", "eye_animation", "nodrawing"],
                         default="overlay",
                         help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person; 'nodrawing' = no drawing and no publishing of image")
+    parser.add_argument(
+        "--estimation_mode_topic",
+        "-emt",
+        type=str,
+        default="/huipred/estimation_mode",
+        help="ROS topic publishing std_msgs/String to switch estimation mode ('ip_inference' or 'depth_based')",
+    )
     parsed_args, ros_args = parser.parse_known_args(args)
 
     rclpy.init(args=ros_args)
