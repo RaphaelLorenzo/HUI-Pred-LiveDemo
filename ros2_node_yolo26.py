@@ -328,6 +328,8 @@ def action_net_inference(
     valid_input_tensors = valid_input_tensors.unsqueeze(1)  # B, M, T, 17, 3
     valid_input_tensors = valid_input_tensors.to(device)
 
+    # valid_input_tensors = valid_input_tensors.half()
+    # with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
     with torch.no_grad():
         out = model(valid_input_tensors)
         probs = torch.sigmoid(out.squeeze())
@@ -391,6 +393,8 @@ class HUIPredNode(Node):
 
             self.ip_model = load_model_from_config(self.ip_config, device="cuda")
             self.ip_model.load_state_dict(model_state_dict, strict=True)
+            # self.ip_model.half()
+            
             
             
             if not isinstance(self.ip_model, ActionNet):
@@ -752,7 +756,7 @@ class HUIPredNode(Node):
 
         # -- YOLO detection + tracking + pose --
         t_infer = time.perf_counter()
-        results = self.pose_model.track(image, persist=True, verbose=False)[0]
+        results = self.pose_model.track(image, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
         t_infer = time.perf_counter() - t_infer
                 
         if args.debug:
