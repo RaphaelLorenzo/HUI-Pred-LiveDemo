@@ -910,6 +910,7 @@ class HUIPredNode(Node):
             # IP outputs
             ip_out = -1.0
             ip_out_f = -1.0
+            last_skeleton = [-1.0] * 17 * 3
             if tid in self.track_history:
                 if self.track_history[tid].get("ip_output"):
                     v = self.track_history[tid]["ip_output"][-1]
@@ -919,8 +920,18 @@ class HUIPredNode(Node):
                     v = self.track_history[tid]["ip_output_filtered"][-1]
                     if isinstance(v, (int, float, np.floating)):
                         ip_out_f = float(v)
+                if self.track_history[tid].get("poses"):
+                    skeleton_array_kps = np.array(self.track_history[tid]["poses"][-1]["keypoints"]).reshape(17, -1) # 17, 2
+                    skeleton_array_kps = skeleton_array_kps.astype(np.float32)
+                    skeleton_array_kps[:,0] /= w
+                    skeleton_array_kps[:,1] /= h
+                    skeleton_array_conf = np.array(self.track_history[tid]["poses"][-1]["scores"]).reshape(17, -1) # 17, 1
+                    skeleton_array_conf = skeleton_array_conf.astype(np.float32)
+                    skeleton_array = np.concatenate([skeleton_array_kps, skeleton_array_conf], axis=-1) # 17, 3
+                    last_skeleton = skeleton_array.flatten().tolist()
+                    # print(last_skeleton)
 
-            tracks_data.extend([float(h), float(w), float(tid), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f])
+            tracks_data.extend([float(h), float(w), float(tid), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f, t_infer, t_ip] + last_skeleton)
 
         tracks_msg.data = tracks_data
         self._pub_tracks.publish(tracks_msg)
