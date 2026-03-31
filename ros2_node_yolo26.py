@@ -61,6 +61,18 @@ BREAKUP_FRAMES_DISENGAGED = 10
 MIN_EYES_SCALE_THRESHOLD = 0.5
 MAX_EYES_SCALE_THRESHOLD = 0.99
 
+IP_MODELS_NAME_TO_INDEX = {
+    "converted_mb_FineTuned_28_02_26_best_ap": 0,
+    "converted_mb_FineTuned_SingleImage_05_03_26_best_adaptative_f1": 1,
+    "converted_mb_FineTuned_SingleImage_NoLegs_19_03_26_best_adaptative_f1": 2,
+    "converted_mb_FineTuned_SingleImage_ReprojectRecenter_19_03_26_best_adaptative_f1": 3,
+    "converted_mb_FineTuned_SingleImageV2_05_03_26_best_adaptative_f1": 4,
+    "converted_mb_FineTuned_Sub3_05_03_26_best_adaptative_f1": 5,
+    "converted_mb_FineTuned_Sub3_Randomized_05_03_26_best_adaptative_f1": 6,
+    "converted_mb_FineTuned_Sub3_Randomized_05_03_26_best_ap": 7,
+    "converted_mb_lite_FineTuned_SingleImage_05_03_26_best_adaptative_f1": 8,
+}
+
 COCO_SKELETON = [
     [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
     [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9],
@@ -372,10 +384,15 @@ class HUIPredNode(Node):
         
         # -- Load interaction-prediction model (optional) --
         self.ip_model = None
-        self.ip_model_str = "None"
+        self.ip_model_index = -1
         self.ip_config = None
         if ip_ckpt:
-            self.ip_model_str = ip_ckpt.split("/")[-1]
+            if ip_ckpt.split("/")[-1] in IP_MODELS_NAME_TO_INDEX:
+                self.ip_model_index = IP_MODELS_NAME_TO_INDEX[ip_ckpt.split("/")[-1]]
+            else:
+                self.get_logger().warning(f"IP model name {ip_ckpt.split('/')[-1]} not found in IP_MODELS_NAME_TO_INDEX, using index -1")
+                self.ip_model_index = -1
+                
             assert("converted_" in ip_ckpt), "IP checkpoint must be a converted checkpoint, use the convert_checkpoints.py script to convert the checkpoint (split state dict and config)"
             self.get_logger().info(f"Loading IP checkpoint from {ip_ckpt}")
             
@@ -941,7 +958,7 @@ class HUIPredNode(Node):
                     last_skeleton = skeleton_array.flatten().tolist()
                     # print(last_skeleton)
             
-            tracks_data.extend([float(h), float(w), float(tid), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f, t_infer, t_ip, self.ip_model_str] + last_skeleton)
+            tracks_data.extend([float(h), float(w), float(tid), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f, t_infer, t_ip, float(self.ip_model_index)] + last_skeleton)
 
         tracks_msg.data = tracks_data
         self._pub_tracks.publish(tracks_msg)
