@@ -372,8 +372,10 @@ class HUIPredNode(Node):
         
         # -- Load interaction-prediction model (optional) --
         self.ip_model = None
+        self.ip_model_str = "None"
         self.ip_config = None
         if ip_ckpt:
+            self.ip_model_str = ip_ckpt.split("/")[-1]
             assert("converted_" in ip_ckpt), "IP checkpoint must be a converted checkpoint, use the convert_checkpoints.py script to convert the checkpoint (split state dict and config)"
             self.get_logger().info(f"Loading IP checkpoint from {ip_ckpt}")
             
@@ -938,8 +940,8 @@ class HUIPredNode(Node):
                     skeleton_array = np.concatenate([skeleton_array_kps, skeleton_array_conf], axis=-1) # 17, 3
                     last_skeleton = skeleton_array.flatten().tolist()
                     # print(last_skeleton)
-
-            tracks_data.extend([float(h), float(w), float(tid), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f, t_infer, t_ip] + last_skeleton)
+            
+            tracks_data.extend([float(h), float(w), float(tid), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f, t_infer, t_ip, self.ip_model_str] + last_skeleton)
 
         tracks_msg.data = tracks_data
         self._pub_tracks.publish(tracks_msg)
