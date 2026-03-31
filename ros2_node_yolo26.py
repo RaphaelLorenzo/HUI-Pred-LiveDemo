@@ -281,7 +281,7 @@ def action_net_inference(
     input_length_in_frames = config["input_length_in_frames"]
     sequence_length = input_length_in_frames // subsample_frames
     # min_frames_inference = max(1, input_length_in_frames // 2)  # ActionNet: allow half window
-    min_frames_inference = input_length_in_frames # cannot allow different length because of stacking
+    min_frames_inference = sequence_length # cannot allow different length because of stacking
     max_index_gap_allowed = 2
 
     eq_w, eq_h = (3840, 1920) if backprojection else image_size
