@@ -294,7 +294,7 @@ def action_net_inference(
         indexes = track_history["indexes"]
         input_tensors = track_history["ip_input_tensor"]
         if len(indexes) < min_frames_inference:
-            return_dict[track_id] = "not_enough_frames"
+            return_dict[track_id] = f"not_enough_frames_{len(indexes)}"
             continue
         last_idx = np.array(indexes[-sequence_length:])
         if np.any(np.diff(last_idx) > max_index_gap_allowed):
@@ -916,6 +916,14 @@ class HUIPredNode(Node):
                     v = self.track_history[tid]["ip_output"][-1]
                     if isinstance(v, (int, float, np.floating)):
                         ip_out = float(v)
+                    elif isinstance(v, str):
+                        if "not_enough_frames" in v:
+                            actual_frames = int(v.split("_")[-1])
+                            ip_out = -1.0 * float(actual_frames)
+                        elif "index_gap_too_large" in v:
+                            ip_out = -2.0
+                        elif "not_enough_valid_joints" in v:
+                            ip_out = -3.0
                 if self.track_history[tid].get("ip_output_filtered"):
                     v = self.track_history[tid]["ip_output_filtered"][-1]
                     if isinstance(v, (int, float, np.floating)):
