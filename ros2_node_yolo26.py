@@ -387,10 +387,11 @@ class HUIPredNode(Node):
         self.ip_model_index = -1
         self.ip_config = None
         if ip_ckpt:
-            if ip_ckpt.split("/")[-1] in IP_MODELS_NAME_TO_INDEX:
-                self.ip_model_index = IP_MODELS_NAME_TO_INDEX[ip_ckpt.split("/")[-1]]
+            ip_ckpt_str = os.path.basename(ip_ckpt)
+            if ip_ckpt_str in IP_MODELS_NAME_TO_INDEX:
+                self.ip_model_index = IP_MODELS_NAME_TO_INDEX[ip_ckpt_str]
             else:
-                self.get_logger().warning(f"IP model name {ip_ckpt.split('/')[-1]} not found in IP_MODELS_NAME_TO_INDEX, using index -1")
+                self.get_logger().warning(f"IP model name {ip_ckpt_str} not found in IP_MODELS_NAME_TO_INDEX, using index -1")
                 self.ip_model_index = -1
                 
             assert("converted_" in ip_ckpt), "IP checkpoint must be a converted checkpoint, use the convert_checkpoints.py script to convert the checkpoint (split state dict and config)"
