@@ -890,11 +890,6 @@ class HUIPredNode(Node):
                     print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box height {relative_box_height:.2f}")
                     self.track_history[tid]["ip_output"].append(estimated_ip)
                     self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
-
-            elif self.current_estimation_mode == "none_based":
-                for i, tid in enumerate(current_track_ids):
-                    self.track_history[tid]["ip_output"].append(0.0)
-                    self.track_history[tid]["ip_output_filtered"].append(0.0)
             
         # -- Build output image and publish --
         h, w = bgr.shape[:2]
@@ -937,70 +932,71 @@ class HUIPredNode(Node):
             img_msg.data = np.array(cv2.imencode(".jpg", img)[1]).tobytes()
             self._pub_overlay.publish(img_msg)
 
-        tracks_msg = Float32MultiArray()
-        tracks_data = []
-        for i, tid_raw in enumerate(current_track_ids):
-            tid = int(tid_raw)
+        if self.current_estimation_mode != "none_based":
+            tracks_msg = Float32MultiArray()
+            tracks_data = []
+            for i, tid_raw in enumerate(current_track_ids):
+                tid = int(tid_raw)
 
-            # bbox + conf
-            x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
-            conf = float(confs[i]) if len(confs) else -1.0
+                # bbox + conf
+                x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
+                conf = float(confs[i]) if len(confs) else -1.0
 
-            # depth
-            _depth_default_value = -1.0 if self.depth_topic != "" else -2.0
-            depth = _depth_default_value
-            if depths[i] is not None:
-                depth = float(depths[i])
+                # depth
+                _depth_default_value = -1.0 if self.depth_topic != "" else -2.0
+                depth = _depth_default_value
+                if depths[i] is not None:
+                    depth = float(depths[i])
 
-            # IP outputs
-            ip_out = -1.0
-            ip_out_f = -1.0
-            last_skeleton = [-1.0] * 17 * 3
-            if tid in self.track_history:
-                if self.track_history[tid].get("ip_output"):
-                    v = self.track_history[tid]["ip_output"][-1]
-                    if isinstance(v, (int, float, np.floating)):
-                        ip_out = float(v)
-                    elif isinstance(v, str):
-                        if "not_enough_frames" in v:
-                            actual_frames = int(v.split("_")[-1])
-                            ip_out = -1.0 * float(actual_frames)
-                        elif "index_gap_too_large" in v:
-                            ip_out = -2.0
-                        elif "not_enough_valid_joints" in v:
-                            ip_out = -3.0
-                if self.track_history[tid].get("ip_output_filtered"):
-                    v = self.track_history[tid]["ip_output_filtered"][-1]
-                    if isinstance(v, (int, float, np.floating)):
-                        ip_out_f = float(v)
-                if self.track_history[tid].get("poses"):
-                    skeleton_array_kps = np.array(self.track_history[tid]["poses"][-1]["keypoints"]).reshape(17, -1) # 17, 2
-                    skeleton_array_kps = skeleton_array_kps.astype(np.float32)
-                    skeleton_array_kps[:,0] /= w
-                    skeleton_array_kps[:,1] /= h
-                    skeleton_array_conf = np.array(self.track_history[tid]["poses"][-1]["scores"]).reshape(17, -1) # 17, 1
-                    skeleton_array_conf = skeleton_array_conf.astype(np.float32)
-                    skeleton_array = np.concatenate([skeleton_array_kps, skeleton_array_conf], axis=-1) # 17, 3
-                    last_skeleton = skeleton_array.flatten().tolist()
-                    # print(last_skeleton)
-            
-            tracks_data.extend([float(h), 
-                                float(w), 
-                                float(tid), 
-                                x1, 
-                                y1, 
-                                x2, 
-                                y2, 
-                                conf, 
-                                depth, 
-                                ip_out, 
-                                ip_out_f, 
-                                t_infer, 
-                                t_ip, 
-                                float(self.ip_model_index)] + last_skeleton)
+                # IP outputs
+                ip_out = -1.0
+                ip_out_f = -1.0
+                last_skeleton = [-1.0] * 17 * 3
+                if tid in self.track_history:
+                    if self.track_history[tid].get("ip_output"):
+                        v = self.track_history[tid]["ip_output"][-1]
+                        if isinstance(v, (int, float, np.floating)):
+                            ip_out = float(v)
+                        elif isinstance(v, str):
+                            if "not_enough_frames" in v:
+                                actual_frames = int(v.split("_")[-1])
+                                ip_out = -1.0 * float(actual_frames)
+                            elif "index_gap_too_large" in v:
+                                ip_out = -2.0
+                            elif "not_enough_valid_joints" in v:
+                                ip_out = -3.0
+                    if self.track_history[tid].get("ip_output_filtered"):
+                        v = self.track_history[tid]["ip_output_filtered"][-1]
+                        if isinstance(v, (int, float, np.floating)):
+                            ip_out_f = float(v)
+                    if self.track_history[tid].get("poses"):
+                        skeleton_array_kps = np.array(self.track_history[tid]["poses"][-1]["keypoints"]).reshape(17, -1) # 17, 2
+                        skeleton_array_kps = skeleton_array_kps.astype(np.float32)
+                        skeleton_array_kps[:,0] /= w
+                        skeleton_array_kps[:,1] /= h
+                        skeleton_array_conf = np.array(self.track_history[tid]["poses"][-1]["scores"]).reshape(17, -1) # 17, 1
+                        skeleton_array_conf = skeleton_array_conf.astype(np.float32)
+                        skeleton_array = np.concatenate([skeleton_array_kps, skeleton_array_conf], axis=-1) # 17, 3
+                        last_skeleton = skeleton_array.flatten().tolist()
+                        # print(last_skeleton)
+                
+                tracks_data.extend([float(h), 
+                                    float(w), 
+                                    float(tid), 
+                                    x1, 
+                                    y1, 
+                                    x2, 
+                                    y2, 
+                                    conf, 
+                                    depth, 
+                                    ip_out, 
+                                    ip_out_f, 
+                                    t_infer, 
+                                    t_ip, 
+                                    float(self.ip_model_index)] + last_skeleton)
 
-        tracks_msg.data = tracks_data
-        self._pub_tracks.publish(tracks_msg)
+            tracks_msg.data = tracks_data
+            self._pub_tracks.publish(tracks_msg)
 
         t_total = time.perf_counter() - t_start
         self.get_logger().info(
@@ -1047,7 +1043,7 @@ def main(args=None):
                         help="Maximum bbox height (relative to image height, 0.1-1.0) for box-based IP estimation")
     parser.add_argument("--default_estimation_mode", "-dem", type=str, choices=["ip_inference", "depth_based", "box_based", "none_based"],
                         default="ip_inference",
-                        help="Default estimation mode: 'ip_inference' = use IP inference model; 'depth_based' = use depth-based IP estimation; 'box_based' = use bbox height as proxy; 'none_based' = always output 0")
+                        help="Default estimation mode: 'ip_inference' = use IP inference model; 'depth_based' = use depth-based IP estimation; 'box_based' = use bbox height as proxy; 'none_based' = do not publish tracks")
     parser.add_argument("--overlay_mode", "-om", type=str, choices=["overlay", "eye_animation", "nodrawing"],
                         default="overlay",
                         help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person; 'nodrawing' = no drawing and no publishing of image")
