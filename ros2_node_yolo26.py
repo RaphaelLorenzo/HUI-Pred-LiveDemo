@@ -733,9 +733,9 @@ class HUIPredNode(Node):
 
     def _estimation_mode_cb(self, msg: String):
         new_mode = (msg.data or "").strip()
-        if new_mode not in ("ip_inference", "depth_based", "box_based"):
+        if new_mode not in ("ip_inference", "depth_based", "box_based", "none_based"):
             self.get_logger().warn(
-                f"Ignoring invalid estimation mode '{new_mode}'. Expected 'ip_inference', 'depth_based', or 'box_based'."
+                f"Ignoring invalid estimation mode '{new_mode}'. Expected 'ip_inference', 'depth_based', 'box_based', or 'none_based'."
             )
             return
 
@@ -890,6 +890,11 @@ class HUIPredNode(Node):
                     print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box height {relative_box_height:.2f}")
                     self.track_history[tid]["ip_output"].append(estimated_ip)
                     self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
+
+            elif self.current_estimation_mode == "none_based":
+                for i, tid in enumerate(current_track_ids):
+                    self.track_history[tid]["ip_output"].append(0.0)
+                    self.track_history[tid]["ip_output_filtered"].append(0.0)
             
         # -- Build output image and publish --
         h, w = bgr.shape[:2]
@@ -1040,9 +1045,9 @@ def main(args=None):
                         help="Minimum bbox height (relative to image height, 0.1-1.0) for box-based IP estimation")
     parser.add_argument("--ip_estimation_box_max", "-ipbmax", type=float, default=0.55,
                         help="Maximum bbox height (relative to image height, 0.1-1.0) for box-based IP estimation")
-    parser.add_argument("--default_estimation_mode", "-dem", type=str, choices=["ip_inference", "depth_based", "box_based"],
+    parser.add_argument("--default_estimation_mode", "-dem", type=str, choices=["ip_inference", "depth_based", "box_based", "none_based"],
                         default="ip_inference",
-                        help="Default estimation mode: 'ip_inference' = use IP inference model; 'depth_based' = use depth-based IP estimation; 'box_based' = use bbox height as proxy")
+                        help="Default estimation mode: 'ip_inference' = use IP inference model; 'depth_based' = use depth-based IP estimation; 'box_based' = use bbox height as proxy; 'none_based' = always output 0")
     parser.add_argument("--overlay_mode", "-om", type=str, choices=["overlay", "eye_animation", "nodrawing"],
                         default="overlay",
                         help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person; 'nodrawing' = no drawing and no publishing of image")
@@ -1051,7 +1056,7 @@ def main(args=None):
         "-emt",
         type=str,
         default="/huipred/estimation_mode",
-        help="ROS topic publishing std_msgs/String to switch estimation mode ('ip_inference', 'depth_based', or 'box_based')",
+        help="ROS topic publishing std_msgs/String to switch estimation mode ('ip_inference', 'depth_based', 'box_based', or 'none_based')",
     )
     parsed_args, ros_args = parser.parse_known_args(args)
 
