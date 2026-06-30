@@ -449,6 +449,13 @@ class HUIPredNode(Node):
         self.ip_estimation_depth_min = args.ip_estimation_depth_min
         self.ip_estimation_depth_max = args.ip_estimation_depth_max
 
+        # -- IP estimation box height range (relative to image height) --
+        self.ip_estimation_box_min = args.ip_estimation_box_min
+        self.ip_estimation_box_max = args.ip_estimation_box_max
+        assert 0.1 <= self.ip_estimation_box_min <= 1.0, "ip_estimation_box_min must be between 0.1 and 1.0"
+        assert 0.1 <= self.ip_estimation_box_max <= 1.0, "ip_estimation_box_max must be between 0.1 and 1.0"
+        assert self.ip_estimation_box_min < self.ip_estimation_box_max, "ip_estimation_box_min must be less than ip_estimation_box_max"
+
         # -- State --
         self.track_history: dict = {}
         self.frame_idx = 0
@@ -473,6 +480,7 @@ class HUIPredNode(Node):
         # Expected values in msg.data:
         # - "ip_inference"
         # - "depth_based"
+        # - "box_based"
         self._estimation_mode_sub = self.create_subscription(
             String,
             args.estimation_mode_topic,
@@ -725,9 +733,9 @@ class HUIPredNode(Node):
 
     def _estimation_mode_cb(self, msg: String):
         new_mode = (msg.data or "").strip()
-        if new_mode not in ("ip_inference", "depth_based"):
+        if new_mode not in ("ip_inference", "depth_based", "box_based"):
             self.get_logger().warn(
-                f"Ignoring invalid estimation mode '{new_mode}'. Expected 'ip_inference' or 'depth_based'."
+                f"Ignoring invalid estimation mode '{new_mode}'. Expected 'ip_inference', 'depth_based', or 'box_based'."
             )
             return
 
@@ -870,6 +878,18 @@ class HUIPredNode(Node):
                         print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from depth {track_depth:.2f}m")
                         self.track_history[tid]["ip_output"].append(estimated_ip)
                         self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
+
+            elif self.current_estimation_mode == "box_based":
+                ip_estimation_box_range = [self.ip_estimation_box_min, self.ip_estimation_box_max]
+                image_height = image.height
+                for i, tid in enumerate(current_track_ids):
+                    box = self.track_history[tid]["detections"][-1]["bbox"]
+                    relative_box_height = (box[3] - box[1]) / image_height
+                    estimated_ip = (relative_box_height - ip_estimation_box_range[0]) / (ip_estimation_box_range[1] - ip_estimation_box_range[0])
+                    estimated_ip = max(0, min(1, estimated_ip))
+                    print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box height {relative_box_height:.2f}")
+                    self.track_history[tid]["ip_output"].append(estimated_ip)
+                    self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
             
         # -- Build output image and publish --
         h, w = bgr.shape[:2]
@@ -959,7 +979,20 @@ class HUIPredNode(Node):
                     last_skeleton = skeleton_array.flatten().tolist()
                     # print(last_skeleton)
             
-            tracks_data.extend([float(h), float(w), float(tid), x1, y1, x2, y2, conf, depth, ip_out, ip_out_f, t_infer, t_ip, float(self.ip_model_index)] + last_skeleton)
+            tracks_data.extend([float(h), 
+                                float(w), 
+                                float(tid), 
+                                x1, 
+                                y1, 
+                                x2, 
+                                y2, 
+                                conf, 
+                                depth, 
+                                ip_out, 
+                                ip_out_f, 
+                                t_infer, 
+                                t_ip, 
+                                float(self.ip_model_index)] + last_skeleton)
 
         tracks_msg.data = tracks_data
         self._pub_tracks.publish(tracks_msg)
@@ -1003,9 +1036,13 @@ def main(args=None):
                         help="Minimum depth for IP estimation (in meters) for depth-based IP estimation")
     parser.add_argument("--ip_estimation_depth_max", "-ipdmax", type=float, default=2.5,
                         help="Maximum depth for IP estimation (in meters) for depth-based IP estimation")
-    parser.add_argument("--default_estimation_mode", "-dem", type=str, choices=["ip_inference", "depth_based"],
+    parser.add_argument("--ip_estimation_box_min", "-ipbmin", type=float, default=0.15,
+                        help="Minimum bbox height (relative to image height, 0.1-1.0) for box-based IP estimation")
+    parser.add_argument("--ip_estimation_box_max", "-ipbmax", type=float, default=0.55,
+                        help="Maximum bbox height (relative to image height, 0.1-1.0) for box-based IP estimation")
+    parser.add_argument("--default_estimation_mode", "-dem", type=str, choices=["ip_inference", "depth_based", "box_based"],
                         default="ip_inference",
-                        help="Default estimation mode: 'ip_inference' = use IP inference model; 'depth_based' = use depth-based IP estimation")
+                        help="Default estimation mode: 'ip_inference' = use IP inference model; 'depth_based' = use depth-based IP estimation; 'box_based' = use bbox height as proxy")
     parser.add_argument("--overlay_mode", "-om", type=str, choices=["overlay", "eye_animation", "nodrawing"],
                         default="overlay",
                         help="Display mode: 'overlay' = camera image with bbox/skeleton/IP overlay; 'eye_animation' = synthetic eye animation driven by highest-IP person; 'nodrawing' = no drawing and no publishing of image")
@@ -1014,7 +1051,7 @@ def main(args=None):
         "-emt",
         type=str,
         default="/huipred/estimation_mode",
-        help="ROS topic publishing std_msgs/String to switch estimation mode ('ip_inference' or 'depth_based')",
+        help="ROS topic publishing std_msgs/String to switch estimation mode ('ip_inference', 'depth_based', or 'box_based')",
     )
     parsed_args, ros_args = parser.parse_known_args(args)
 
