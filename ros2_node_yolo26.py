@@ -889,7 +889,7 @@ class HUIPredNode(Node):
                     box_bottom_y = box[3]
                     box_bottom_relative = (image_height - box_bottom_y) / image_height
                     # 3m threhsold is 17.5% of the image height, 1.5m is 3.75% of the image height
-                    estimated_ip = (0.175 - box_bottom_relative) / (0.175 - 0.0375)
+                    estimated_ip = (0.175 - box_bottom_relative) / (0.26 - 0.1)
                     estimated_ip = max(0, min(1, estimated_ip))
                     # relative_box_height = (box[3] - box[1]) / image_height
                     # estimated_ip = (relative_box_height - ip_estimation_box_range[0]) / (ip_estimation_box_range[1] - ip_estimation_box_range[0])
