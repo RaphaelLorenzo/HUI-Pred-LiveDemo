@@ -888,14 +888,14 @@ class HUIPredNode(Node):
                     box = self.track_history[tid]["detections"][-1]["bbox"]
                     box_bottom_y = box[3]
                     box_bottom_relative = (image_height - box_bottom_y) / image_height
-                    # 3m threhsold is 17.5% of the image height, 1.5m is 0% of the image height
-                    estimated_ip = (0.175 - box_bottom_relative) / (0.175 - 0)
+                    # 3m threhsold is 17.5% of the image height, 1.5m is 3.75% of the image height
+                    estimated_ip = (0.175 - box_bottom_relative) / (0.175 - 0.375)
                     estimated_ip = max(0, min(1, estimated_ip))
                     # relative_box_height = (box[3] - box[1]) / image_height
                     # estimated_ip = (relative_box_height - ip_estimation_box_range[0]) / (ip_estimation_box_range[1] - ip_estimation_box_range[0])
                     # estimated_ip = max(0, min(1, estimated_ip))
                     # print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box height {relative_box_height:.2f}")
-                    print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box bottom {box_bottom_relative:.2f} (interp 0 to 17.5% of image height)")
+                    print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box bottom {box_bottom_relative:.2f} (interp 3.75% to 17.5% of image height)")
                     self.track_history[tid]["ip_output"].append(estimated_ip)
                     self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
             
