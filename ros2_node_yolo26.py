@@ -782,6 +782,10 @@ class HUIPredNode(Node):
         if image.width == 3840:
             image = image.resize((1920, 960))
 
+        print("--------------------------------")
+        print("IMAGE SIZE : ", image.width, image.height)
+        print("--------------------------------")
+
         # -- YOLO detection + tracking + pose --
         t_infer = time.perf_counter()
         results = self.pose_model.track(image, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
