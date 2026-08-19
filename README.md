@@ -50,7 +50,7 @@ Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
 
 ### Input
 
-- `/camera/color/image_raw/compressed`  
+- `/rgb/color/image_raw/compressed`  
   **Type:** `sensor_msgs/msg/CompressedImage`  
   **Description:** Main RGB camera stream (compressed image).
 
@@ -58,22 +58,48 @@ Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
   **Type:** `sensor_msgs/msg/CompressedImage`  
   **Description:** (Optional, if using depth) Depth image aligned to the color stream (compressed image).
 
+- `/rgb/color/camera_info`  
+  **Type:** `sensor_msgs/msg/CameraInfo`  
+  **Description:** (Required when using depth) Camera intrinsics used to project the torso pixel and median torso depth into a 3D camera-frame position.
+
 ### Output
 
-- `/huilive_overlay/compressed`  
+- `/huipred/overlay/compressed`  
   **Type:** `sensor_msgs/msg/CompressedImage`  
   **Description:** The camera image overlaid with YOLO pose, predicted interaction, and other visualizations according to the overlay mode.
 
-- `/huilive_tracks`  
+- `/huipred/tracks`  
   **Type:** `std_msgs/msg/Float32MultiArray`  
-  **Description:** Sequence of per-person tracking information for each detection in the current frame:  
-    `[image_height, image_width, x1, y1, x2, y2, box_confidence, depth, ip_output, ip_output_filtered]` (repeated for each track/person).  
+  **Description:** Flat array of per-person tracking records for the current frame. Each detected person occupies **70 consecutive floats**. For person index `p` (0-based), use base offset `p * 70`.
 
-  - `x1, y1, x2, y2`: Bounding box coordinates (float)  
-  - `box_confidence`: YOLO box confidence score  
-  - `depth`: Estimated depth (or -1.0 if unavailable)  
-  - `ip_output`: Latest interaction prediction output for this track  
-  - `ip_output_filtered`: Filtered/averaged interaction prediction for temporal stability
+  **Payload length:** `70 floats × number_of_tracks`
+
+  **Offsets (relative to each person's base `p * 70`):**
+
+  | Offset | Field | Description |
+  |--------|-------|-------------|
+  | 0 | `image_height` | Output image height in pixels |
+  | 1 | `image_width` | Output image width in pixels |
+  | 2 | `track_id` | YOLO/ByteTrack track identifier |
+  | 3 | `x1` | Bounding box left (pixels) |
+  | 4 | `y1` | Bounding box top (pixels) |
+  | 5 | `x2` | Bounding box right (pixels) |
+  | 6 | `y2` | Bounding box bottom (pixels) |
+  | 7 | `box_confidence` | YOLO box confidence score |
+  | 8 | `depth` | Median torso depth in meters from 10 depth samples (5 per torso diagonal). `-1.0` if depth enabled but unavailable, `-2.0` if depth disabled |
+  | 9 | `torso_u` | Torso pixel u (median of valid sample locations). `-1.0` if unavailable |
+  | 10 | `torso_v` | Torso pixel v (median of valid sample locations). `-1.0` if unavailable |
+  | 11 | `torso_x` | 3D torso x in camera frame (meters). `-1.0` if unavailable |
+  | 12 | `torso_y` | 3D torso y in camera frame (meters). `-1.0` if unavailable |
+  | 13 | `torso_z` | 3D torso z in camera frame (meters). `-1.0` if unavailable |
+  | 14 | `ip_output` | Latest interaction prediction for this track |
+  | 15 | `ip_output_filtered` | Filtered/averaged interaction prediction |
+  | 16 | `yolo_inference_time_s` | YOLO inference time for this frame (seconds) |
+  | 17 | `ip_inference_time_s` | IP inference time for this frame (seconds) |
+  | 18 | `ip_model_index` | Loaded IP checkpoint index, or `-1` if unknown |
+  | 19–69 | `skeleton` | 17 COCO joints × 3 values each: `[x, y, conf]` normalized to `[0, 1]` for x/y. Joint `i` starts at offset `19 + i * 3` |
+
+  **Example:** To read person 2's bounding box and depth from `data`: `base = 2 * 70`, then `x1 = data[base + 3]`, `depth = data[base + 8]`.
 
 
 ## Remarks

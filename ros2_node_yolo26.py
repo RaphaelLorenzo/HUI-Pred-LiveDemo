@@ -21,9 +21,14 @@ from functools import partial
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage, Image as RosImage
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
 from std_msgs.msg import Float32MultiArray, String
 import message_filters
+
+try:
+    from cv_bridge import CvBridge
+except ImportError:
+    CvBridge = None
 
 
 # WARNING : this is very weird : but if ultralytics is imported after torch, the YOLO model does not work (no detections !)
@@ -91,22 +96,23 @@ METADATA_CKPT_COLUMNS = [
 # Helper functions (ported from folder_demo_yolo26.py)
 # ---------------------------------------------------------------------------
 
-def estimate_torso_depth(
+def estimate_torso_depth_and_center(
     keypoints: np.ndarray,
     scores: np.ndarray,
     depth_image: np.ndarray,
     kp_thresh: float,
 ):
     """
-    Estimate depth at the center of the torso using diagonal sampling.
+    Estimate torso center pixel and depth from diagonal depth sampling.
 
-    Uses 6 points: 3 sampled at 0.25, 0.5, 0.75 on diagonal left_shoulder->right_hip
-    and 3 on diagonal right_shoulder->left_hip.  Takes median of valid samples.
+    Samples 5 points on each torso diagonal, keeps valid depth values only, and
+    returns the median depth together with the median sampled pixel location.
     """
     LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
     LEFT_HIP, RIGHT_HIP = 11, 12
-    sample_ratios = [0.25, 0.5, 0.75]
+    sample_ratios = np.linspace(1.0 / 6.0, 5.0 / 6.0, 5)
     depth_samples = []
+    sample_points = []
     h, w = depth_image.shape[:2]
 
     if scores[LEFT_SHOULDER] > kp_thresh and scores[RIGHT_HIP] > kp_thresh:
@@ -114,18 +120,52 @@ def estimate_torso_depth(
         for r in sample_ratios:
             x, y = int(pt1[0] + r * (pt2[0] - pt1[0])), int(pt1[1] + r * (pt2[1] - pt1[1]))
             if 0 <= x < w and 0 <= y < h:
-                depth_samples.append(depth_image[y, x])
+                depth_value = float(depth_image[y, x])
+                if np.isfinite(depth_value) and depth_value > 0:
+                    depth_samples.append(depth_value)
+                    sample_points.append((float(x), float(y)))
 
     if scores[RIGHT_SHOULDER] > kp_thresh and scores[LEFT_HIP] > kp_thresh:
         pt1, pt2 = keypoints[RIGHT_SHOULDER], keypoints[LEFT_HIP]
         for r in sample_ratios:
             x, y = int(pt1[0] + r * (pt2[0] - pt1[0])), int(pt1[1] + r * (pt2[1] - pt1[1]))
             if 0 <= x < w and 0 <= y < h:
-                depth_samples.append(depth_image[y, x])
+                depth_value = float(depth_image[y, x])
+                if np.isfinite(depth_value) and depth_value > 0:
+                    depth_samples.append(depth_value)
+                    sample_points.append((float(x), float(y)))
 
     if len(depth_samples) == 0:
-        return -1.0
-    return float(np.median(depth_samples))
+        return None, None
+
+    sample_points_array = np.array(sample_points, dtype=np.float32)
+    torso_center_uv = np.median(sample_points_array, axis=0)
+    torso_depth = float(np.median(np.array(depth_samples, dtype=np.float32)))
+    return torso_depth, torso_center_uv
+
+
+def project_pixel_to_3d(
+    pixel_xy: np.ndarray,
+    depth_m: float,
+    camera_matrix: np.ndarray,
+):
+    """Project one image pixel with depth into camera-frame 3D coordinates."""
+    if pixel_xy is None or depth_m is None or depth_m <= 0 or camera_matrix is None:
+        return None
+
+    fx = float(camera_matrix[0, 0])
+    fy = float(camera_matrix[1, 1])
+    cx = float(camera_matrix[0, 2])
+    cy = float(camera_matrix[1, 2])
+    if fx == 0.0 or fy == 0.0:
+        return None
+
+    u = float(pixel_xy[0])
+    v = float(pixel_xy[1])
+    x = (u - cx) * depth_m / fx
+    y = (v - cy) * depth_m / fy
+    z = depth_m
+    return np.array([x, y, z], dtype=np.float32)
 
 
 def load_model_from_config(config: dict, device: torch.device):
@@ -364,10 +404,16 @@ class HUIPredNode(Node):
         rgb_topic = args.rgb_topic
         depth_topic = args.depth_topic or ""
         self.depth_topic = depth_topic
-        self.compressed_depth = "compressed" in depth_topic
+        self.compressed_depth = (
+            depth_topic.endswith("/compressed")
+            or depth_topic.endswith("/compressedDepth")
+            or "/compressedDepth/" in depth_topic
+        )
         yolo_path = args.yolo_model_path
         ip_ckpt = args.interaction_prediction_checkpoint or ""
         self._use_depth = depth_topic != ""
+        self.camera_info_topic = args.camera_info_topic or ""
+        self._camera_matrix = None
 
         # Args-like namespace consumed by helper functions
         self._args = types.SimpleNamespace(
@@ -462,14 +508,18 @@ class HUIPredNode(Node):
         self.filter_length = args.filter_length
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._process_lock = threading.Lock()
+        self._cv_bridge = CvBridge() if CvBridge is not None else None
+        if self._use_depth and self.compressed_depth and self._cv_bridge is None:
+            self.get_logger().warning(
+                "cv_bridge is unavailable; compressed depth decoding falls back to OpenCV PNG decode only"
+            )
 
         # -- Publisher: /huipred/overlay (annotated image with detections) --
         self._pub_overlay = self.create_publisher(
             CompressedImage, "/huipred/overlay/compressed", 10
         )
 
-        # -- Publisher: /huipred/tracks (flat float array; 8 floats per track) --
-        # Per track: [x1, y1, x2, y2, conf, depth(-1 if none), ip_output(-1 if none), ip_output_filtered(-1 if none)]
+        # -- Publisher: /huipred/tracks (flat float array; metadata + track payload) --
         self._pub_tracks = self.create_publisher(
             Float32MultiArray, "/huipred/tracks", 10
         )
@@ -493,8 +543,17 @@ class HUIPredNode(Node):
 
         # -- Subscribers --
         if self._use_depth:
+            depth_mode = "CompressedImage" if self.compressed_depth else "Image"
             self.get_logger().info(
-                f"Subscribing (synced): RGB={rgb_topic}  Depth={depth_topic}"
+                f"Subscribing (synced): RGB={rgb_topic}  Depth={depth_topic} ({depth_mode})"
+            )
+            if self.camera_info_topic == "":
+                raise ValueError("camera_info_topic is required when depth is enabled")
+            self._sub_camera_info = self.create_subscription(
+                CameraInfo,
+                self.camera_info_topic,
+                self._camera_info_cb,
+                10,
             )
             self._sub_rgb = message_filters.Subscriber(self, CompressedImage, rgb_topic)
             if self.compressed_depth:
@@ -522,23 +581,75 @@ class HUIPredNode(Node):
         return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
     @staticmethod
-    def _decode_compressed_depth(msg: CompressedImage):
+    def _extract_png_payload(raw: bytes):
+        """Return the byte slice containing a PNG payload, if any."""
+        png_magic = b"\x89PNG\r\n\x1a\n"
+        png_offset = raw.find(png_magic)
+        if png_offset >= 0:
+            return raw[png_offset:]
+
+        if len(raw) > 12:
+            # ROS compressedDepth transport prepends a 12-byte config header.
+            payload = raw[12:]
+            if payload.startswith(png_magic):
+                return payload
+        return None
+
+    def _decode_compressed_depth(self, msg: CompressedImage):
         """Decode a CompressedImage carrying depth data.
 
-        Handles both raw-compressed (PNG/TIFF) and the ROS compressedDepth
-        transport plugin format (12-byte header before the PNG payload).
+        Prefers cv_bridge for RealSense/ROS compressedDepth messages, then falls
+        back to OpenCV PNG decoding.
         """
         raw = bytes(msg.data)
-        fmt = msg.format.lower()
+        fmt = (msg.format or "").lower()
+        if len(raw) == 0:
+            self.get_logger().warn(
+                f"Compressed depth message is empty (format='{msg.format}')"
+            )
+            return None
 
-        if "compresseddepth" in fmt:
-            # compressedDepth transport: 12-byte ConfigHeader then PNG/RVL
-            if len(raw) <= 12:
-                return None
-            raw = raw[12:]
+        if self._cv_bridge is not None:
+            try:
+                depth = self._cv_bridge.compressed_imgmsg_to_cv2(
+                    msg, desired_encoding="passthrough"
+                )
+                if depth is not None and depth.size > 0:
+                    if depth.ndim == 3:
+                        depth = depth[:, :, 0]
+                    return depth
+            except Exception as e:
+                self.get_logger().warning(
+                    f"cv_bridge compressed depth decode failed (format='{msg.format}', "
+                    f"bytes={len(raw)}): {e}"
+                )
 
-        buf = np.frombuffer(raw, dtype=np.uint8)
-        return cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        png_payload = self._extract_png_payload(raw)
+        if png_payload is None:
+            self.get_logger().warn(
+                "Compressed depth payload is not PNG (possibly RVL). "
+                f"Use the raw depth topic instead of '/compressed' "
+                f"(format='{msg.format}', bytes={len(raw)})."
+            )
+            return None
+
+        buf = np.frombuffer(png_payload, dtype=np.uint8)
+        if buf.size == 0:
+            self.get_logger().warn(
+                f"Compressed depth PNG payload is empty (format='{msg.format}')"
+            )
+            return None
+
+        depth = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            self.get_logger().warn(
+                f"OpenCV failed to decode compressed depth PNG "
+                f"(format='{msg.format}', bytes={len(raw)})"
+            )
+            return None
+        if depth.ndim == 3:
+            depth = depth[:, :, 0]
+        return depth
 
     @staticmethod
     def _decode_depth_image(msg: RosImage, logger):
@@ -549,36 +660,78 @@ class HUIPredNode(Node):
         - 32FC1 -> float32 depth
         """
         if msg.height == 0 or msg.width == 0:
+            logger.warn(
+                f"Depth image has invalid shape {msg.width}x{msg.height} "
+                f"(encoding='{msg.encoding}')"
+            )
             return None
 
         enc = (msg.encoding or "").lower()
 
         if enc in ("16uc1", "mono16"):
             dtype = np.dtype(np.uint16)
-            channels = 1
         elif enc == "32fc1":
             dtype = np.dtype(np.float32)
-            channels = 1
         else:
-            logger.warn(f"Unsupported depth encoding: {enc}")
+            logger.warn(f"Unsupported depth encoding: '{msg.encoding}'")
             return None
 
-        # Respect endianness from ROS message.
         if msg.is_bigendian:
             dtype = dtype.newbyteorder(">")
         else:
             dtype = dtype.newbyteorder("<")
 
+        bytes_per_pixel = dtype.itemsize
+        row_stride_bytes = msg.step if msg.step > 0 else msg.width * bytes_per_pixel
+        expected_bytes = row_stride_bytes * msg.height
+        if len(msg.data) < expected_bytes:
+            logger.warn(
+                f"Depth image data too short: got {len(msg.data)} bytes, "
+                f"expected at least {expected_bytes} "
+                f"({msg.width}x{msg.height}, step={msg.step}, encoding='{msg.encoding}')"
+            )
+            return None
+
         try:
             arr = np.frombuffer(msg.data, dtype=dtype)
-            expected_pixels = msg.height * msg.width * channels
-            if arr.size < expected_pixels:
-                return None
-            arr = arr[:expected_pixels].reshape((msg.height, msg.width))
-            return arr
+            row_stride_elems = row_stride_bytes // bytes_per_pixel
+            arr = arr.reshape((msg.height, row_stride_elems))[:, :msg.width]
+            return np.ascontiguousarray(arr)
         except Exception as e:
-            logger.warn(f"Failed to decode depth image: {e}")
+            logger.warn(
+                f"Failed to decode depth image ({msg.width}x{msg.height}, "
+                f"step={msg.step}, encoding='{msg.encoding}'): {e}"
+            )
             return None
+
+    def _describe_depth_message(self, depth_msg):
+        """Summarize a depth message for decode-failure logs."""
+        if isinstance(depth_msg, CompressedImage):
+            return (
+                f"type=CompressedImage format='{depth_msg.format}' "
+                f"bytes={len(depth_msg.data)}"
+            )
+        return (
+            f"type=Image encoding='{depth_msg.encoding}' "
+            f"size={depth_msg.width}x{depth_msg.height} step={depth_msg.step} "
+            f"bytes={len(depth_msg.data)}"
+        )
+
+    def _log_depth_decode_failure(self, depth_msg):
+        mode = "compressed" if self.compressed_depth else "raw"
+        self.get_logger().warn(
+            f"Failed to decode depth message ({mode}, topic='{self.depth_topic}', "
+            f"{self._describe_depth_message(depth_msg)}). "
+            "If using RealSense, prefer the raw topic "
+            "'.../aligned_depth_to_color/image_raw' (no /compressedDepth suffix)."
+        )
+
+    def _camera_info_cb(self, msg: CameraInfo):
+        """Cache the latest camera intrinsic matrix for 3D projection."""
+        try:
+            self._camera_matrix = np.array(msg.k, dtype=np.float32).reshape(3, 3)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to parse camera info: {e}")
 
     # ----- overlay / eye animation builders -----------------------------------
 
@@ -715,7 +868,7 @@ class HUIPredNode(Node):
             self.get_logger().warn("Failed to decode RGB message")
             return
         if depth is None:
-            self.get_logger().warn("Failed to decode depth message")
+            self._log_depth_decode_failure(depth_msg)
             return
         self._process_frame(bgr, depth)
 
@@ -813,14 +966,27 @@ class HUIPredNode(Node):
             scores_all = scores_all.cpu().numpy()
 
             depths = []
+            torso_pixels = []
+            torso_positions_3d = []
             if depth_image is not None:
                 for i in range(len(current_track_ids)):
-                    d_raw = estimate_torso_depth(
+                    d_raw, torso_center_uv = estimate_torso_depth_and_center(
                         keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
                     )
-                    depths.append(d_raw / args.depth_scale if d_raw > 0 else None)
+                    depth_m = d_raw / args.depth_scale if d_raw is not None else None
+                    depths.append(depth_m)
+                    torso_pixels.append(torso_center_uv)
+                    torso_positions_3d.append(
+                        project_pixel_to_3d(
+                            torso_center_uv,
+                            depth_m,
+                            self._camera_matrix,
+                        )
+                    )
             else:
                 depths = [None] * len(current_track_ids)
+                torso_pixels = [None] * len(current_track_ids)
+                torso_positions_3d = [None] * len(current_track_ids)
 
             for i, tid in enumerate(current_track_ids):
                 tid = int(tid)
@@ -835,7 +1001,8 @@ class HUIPredNode(Node):
                     "bbox": boxes[i].tolist(),
                     "conf": float(confs[i]),
                     "depth": depths[i] if depths[i] is not None else None,
-                    # **({"depth": depths[i]} if depths[i] is not None else {}),
+                    "torso_pixel": torso_pixels[i].tolist() if torso_pixels[i] is not None else None,
+                    "torso_position_3d": torso_positions_3d[i].tolist() if torso_positions_3d[i] is not None else None,
                 })
                 self.track_history[tid]["poses"].append({
                     "frame": self.frame_idx,
@@ -956,6 +1123,19 @@ class HUIPredNode(Node):
                 if depths[i] is not None:
                     depth = float(depths[i])
 
+                torso_u = -1.0
+                torso_v = -1.0
+                torso_x = -1.0
+                torso_y = -1.0
+                torso_z = depth
+                if torso_pixels[i] is not None:
+                    torso_u = float(torso_pixels[i][0])
+                    torso_v = float(torso_pixels[i][1])
+                if torso_positions_3d[i] is not None:
+                    torso_x = float(torso_positions_3d[i][0])
+                    torso_y = float(torso_positions_3d[i][1])
+                    torso_z = float(torso_positions_3d[i][2])
+
                 # IP outputs
                 ip_out = -1.0
                 ip_out_f = -1.0
@@ -997,6 +1177,11 @@ class HUIPredNode(Node):
                                     y2, 
                                     conf, 
                                     depth, 
+                                    torso_u,
+                                    torso_v,
+                                    torso_x,
+                                    torso_y,
+                                    torso_z,
                                     ip_out, 
                                     ip_out_f, 
                                     t_infer, 
@@ -1017,14 +1202,28 @@ class HUIPredNode(Node):
 
 # ---------------------------------------------------------------------------
 
-def main(args=None):
+def main(parsed_args, ros_args):
+    rclpy.init(args=ros_args)
+    node = HUIPredNode(parsed_args)
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="ROS2 node for HUI-Pred: subscribe to RGB/depth CompressedImage topics, run YOLO pose + interaction prediction.",
     )
-    parser.add_argument("--rgb_topic", "-r", type=str, default="/camera/color/image_raw/compressed",
+    parser.add_argument("--rgb_topic", "-r", type=str, default="/rgbd/realsense_head_front/color/image_raw/compressed",
                         help="Topic for RGB CompressedImage")
-    parser.add_argument("--depth_topic", "-dt", type=str, default=None,
-                        help="Topic for depth CompressedImage (optional; if set, RGB and depth are time-synced)")
+    parser.add_argument("--depth_topic", "-dt", type=str, default="/rgbd/realsense_head_front/aligned_depth_to_color/image_raw",
+                        help="Topic for depth Image or CompressedImage/compressedDepth (optional; if set, RGB and depth are time-synced)")
+    parser.add_argument("--camera_info_topic", type=str, default="/rgbd/realsense_head_front/color/camera_info",
+                        help="Topic for CameraInfo used to project torso depth into 3D camera coordinates")
     parser.add_argument("--yolo_model_path", "-y", type=str, default="checkpoints/yolo26x-pose.pt",
                         help="Path to YOLO pose model")
     parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default="checkpoints/converted_mb_FineTuned_28_02_26_best_ap",
@@ -1062,18 +1261,5 @@ def main(args=None):
         default="/huipred/estimation_mode",
         help="ROS topic publishing std_msgs/String to switch estimation mode ('ip_inference', 'depth_based', 'box_based', or 'none_based')",
     )
-    parsed_args, ros_args = parser.parse_known_args(args)
-
-    rclpy.init(args=ros_args)
-    node = HUIPredNode(parsed_args)
-    try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == "__main__":
-    main()
+    parsed_args, ros_args = parser.parse_known_args()
+    main(parsed_args, ros_args)
