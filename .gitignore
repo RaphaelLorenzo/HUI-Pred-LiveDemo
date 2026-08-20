@@ -1,7 +1,7 @@
 .vscode 
 *.pt
 *.pth
-checkpoints
+checkpoints_save/
 __pycache__
 *.mp4
 *.gif
