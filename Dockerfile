@@ -81,6 +81,10 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=/usr/local/cuda/bin:$PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/tegra:$LD_LIBRARY_PATH
 
+# Pre-download YOLO pose weights so they are cached in the image
+COPY download_yolo_weights.py /tmp/download_yolo_weights.py
+RUN python /tmp/download_yolo_weights.py --output_path /root/.config/Ultralytics/weights/checkpoints/yolo26x-pose.pt
+
 # Ensure the environment is active for any command run via 'docker run'
 # ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "ai_env", "/bin/bash", "-l", "-c"]
 CMD ["/bin/bash"]

@@ -101,6 +101,10 @@ Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
 
   **Example:** To read person 2's bounding box and depth from `data`: `base = 2 * 70`, then `x1 = data[base + 3]`, `depth = data[base + 8]`.
 
+- `/huipred/torso_poses`  
+  **Type:** `geometry_msgs/msg/PoseArray`  
+  **Description:** 3D torso positions for the current frame, in the camera optical frame (`header.frame_id` comes from `camera_info` when available, otherwise `camera_optical_frame`). Only **valid** projections are included (one `Pose` per person with a successful depth + camera_info projection). Orientation is identity (`w=1`); only `position.x/y/z` is meaningful.
+
 
 ## Remarks
 For compatibily reasons the checkpoints containing config and `state_dict` must be separated using `convert_checkpoints.py` before running using the jetson docker.

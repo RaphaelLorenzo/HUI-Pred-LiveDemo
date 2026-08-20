@@ -22,6 +22,7 @@ from functools import partial
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
+from geometry_msgs.msg import Pose, PoseArray
 from std_msgs.msg import Float32MultiArray, String
 import message_filters
 
@@ -101,6 +102,7 @@ def estimate_torso_depth_and_center(
     scores: np.ndarray,
     depth_image: np.ndarray,
     kp_thresh: float,
+    logger,
 ):
     """
     Estimate torso center pixel and depth from diagonal depth sampling.
@@ -124,6 +126,9 @@ def estimate_torso_depth_and_center(
                 if np.isfinite(depth_value) and depth_value > 0:
                     depth_samples.append(depth_value)
                     sample_points.append((float(x), float(y)))
+    else:
+        logger.info(f"Left shoulder score: {scores[LEFT_SHOULDER]} | Right hip score: {scores[RIGHT_HIP]} | Insufficient")
+                
 
     if scores[RIGHT_SHOULDER] > kp_thresh and scores[LEFT_HIP] > kp_thresh:
         pt1, pt2 = keypoints[RIGHT_SHOULDER], keypoints[LEFT_HIP]
@@ -134,8 +139,11 @@ def estimate_torso_depth_and_center(
                 if np.isfinite(depth_value) and depth_value > 0:
                     depth_samples.append(depth_value)
                     sample_points.append((float(x), float(y)))
+    else:
+        logger.info(f"Right shoulder score: {scores[RIGHT_SHOULDER]} | Left hip score: {scores[LEFT_HIP]} | Insufficient")
 
-    if len(depth_samples) == 0:
+    if len(depth_samples) < 3:
+        logger.warn("Not enough depth samples to estimate torso center and depth")
         return None, None
 
     sample_points_array = np.array(sample_points, dtype=np.float32)
@@ -414,6 +422,7 @@ class HUIPredNode(Node):
         self._use_depth = depth_topic != ""
         self.camera_info_topic = args.camera_info_topic or ""
         self._camera_matrix = None
+        self._camera_frame_id = "camera_optical_frame"
 
         # Args-like namespace consumed by helper functions
         self._args = types.SimpleNamespace(
@@ -522,6 +531,11 @@ class HUIPredNode(Node):
         # -- Publisher: /huipred/tracks (flat float array; metadata + track payload) --
         self._pub_tracks = self.create_publisher(
             Float32MultiArray, "/huipred/tracks", 10
+        )
+
+        # -- Publisher: /huipred/torso_poses (valid 3D torso positions only) --
+        self._pub_torso_poses = self.create_publisher(
+            PoseArray, "/huipred/torso_poses", 10
         )
         self._overlay_mode = args.overlay_mode
         self.get_logger().info(f"Overlay mode: {self._overlay_mode}")
@@ -730,6 +744,7 @@ class HUIPredNode(Node):
         """Cache the latest camera intrinsic matrix for 3D projection."""
         try:
             self._camera_matrix = np.array(msg.k, dtype=np.float32).reshape(3, 3)
+            self._camera_frame_id = msg.header.frame_id
         except Exception as e:
             self.get_logger().warn(f"Failed to parse camera info: {e}")
 
@@ -953,6 +968,8 @@ class HUIPredNode(Node):
             current_track_ids = []
             boxes = confs = keypoints_all = scores_all = []
             depths = []
+            torso_pixels = []
+            torso_positions_3d = []
         else:
             current_track_ids = results.boxes.id.int().cpu().numpy()
             boxes = results.boxes.xyxy.cpu().numpy()
@@ -971,11 +988,13 @@ class HUIPredNode(Node):
             if depth_image is not None:
                 for i in range(len(current_track_ids)):
                     d_raw, torso_center_uv = estimate_torso_depth_and_center(
-                        keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
+                        keypoints_all[i], scores_all[i], depth_image, args.kp_thresh, self.get_logger()
                     )
                     depth_m = d_raw / args.depth_scale if d_raw is not None else None
                     depths.append(depth_m)
                     torso_pixels.append(torso_center_uv)
+                    if self._camera_matrix is None:
+                        self.get_logger().warn("Camera matrix is not set, 3D projection will fail")
                     torso_positions_3d.append(
                         project_pixel_to_3d(
                             torso_center_uv,
@@ -1102,7 +1121,7 @@ class HUIPredNode(Node):
         if img is not None:
             img_msg = CompressedImage()
             img_msg.header.stamp = self.get_clock().now().to_msg()
-            img_msg.header.frame_id = "camera_optical_frame"
+            img_msg.header.frame_id = self._camera_frame_id
             img_msg.format = "jpeg"
             img_msg.data = np.array(cv2.imencode(".jpg", img)[1]).tobytes()
             self._pub_overlay.publish(img_msg)
@@ -1191,6 +1210,21 @@ class HUIPredNode(Node):
             tracks_msg.data = tracks_data
             self._pub_tracks.publish(tracks_msg)
 
+            # Publish valid torso XYZ as PoseArray (identity orientation).
+            torso_poses_msg = PoseArray()
+            torso_poses_msg.header.stamp = self.get_clock().now().to_msg()
+            torso_poses_msg.header.frame_id = self._camera_frame_id
+            for pos in torso_positions_3d:
+                if pos is None:
+                    continue
+                pose = Pose()
+                pose.position.x = float(pos[0])
+                pose.position.y = float(pos[1])
+                pose.position.z = float(pos[2])
+                pose.orientation.w = 1.0
+                torso_poses_msg.poses.append(pose)
+            self._pub_torso_poses.publish(torso_poses_msg)
+
         t_total = time.perf_counter() - t_start
         self.get_logger().info(
             f"Frame {self.frame_idx} | {len(current_track_ids)} tracks | "
@@ -1220,7 +1254,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--rgb_topic", "-r", type=str, default="/rgbd/realsense_head_front/color/image_raw/compressed",
                         help="Topic for RGB CompressedImage")
-    parser.add_argument("--depth_topic", "-dt", type=str, default="/rgbd/realsense_head_front/aligned_depth_to_color/image_raw",
+    parser.add_argument("--depth_topic", "-dt", type=str, default="/rgbd/realsense_head_front/aligned_depth_to_color/image_raw/compressedDepth",
                         help="Topic for depth Image or CompressedImage/compressedDepth (optional; if set, RGB and depth are time-synced)")
     parser.add_argument("--camera_info_topic", type=str, default="/rgbd/realsense_head_front/color/camera_info",
                         help="Topic for CameraInfo used to project torso depth into 3D camera coordinates")
