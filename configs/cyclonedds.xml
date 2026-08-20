@@ -11,7 +11,7 @@
             <ParticipantIndex>auto</ParticipantIndex>
             <Peers>
                 <Peer address="10.68.0.42" />
-                <Peer address="10.68.0.1" />
+                <!-- <Peer address="10.68.0.1" /> -->
                 <Peer address="localhost" />
             </Peers>
             <MaxAutoParticipantIndex>60</MaxAutoParticipantIndex>
