@@ -575,7 +575,7 @@ class HUIPredNode(Node):
             else:
                 self._sub_depth = message_filters.Subscriber(self, RosImage, depth_topic)
             self._sync = message_filters.ApproximateTimeSynchronizer(
-                [self._sub_rgb, self._sub_depth], queue_size=10, slop=0.1,
+                [self._sub_rgb, self._sub_depth], queue_size=50, slop=0.5,
             )
             self._sync.registerCallback(self._synced_cb)
         else:
