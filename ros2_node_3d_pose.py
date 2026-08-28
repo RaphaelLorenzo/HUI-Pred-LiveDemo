@@ -60,6 +60,33 @@ def confidence_to_alpha(conf: float) -> float:
     return min(1.0, (conf - CONF_ALPHA_MIN) / (1.0 - CONF_ALPHA_MIN))
 
 
+def dim_bgr_color(color: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
+    """Scale BGR color brightness by alpha while keeping the same hue as the bbox."""
+    b, g, r = color
+    return int(b * alpha), int(g * alpha), int(r * alpha)
+
+
+def draw_person_2d(
+    debug: np.ndarray,
+    kp: np.ndarray,
+    sc: np.ndarray,
+    color: tuple[int, int, int],
+):
+    """Draw one person's bbox-matching skeleton directly (no alpha blend onto camera)."""
+    for j, k in COCO_SKELETON:
+        line_alpha = confidence_to_alpha(min(float(sc[j]), float(sc[k])))
+        if line_alpha <= 0.0:
+            continue
+        pt1 = tuple(kp[j].astype(int))
+        pt2 = tuple(kp[k].astype(int))
+        cv2.line(debug, pt1, pt2, dim_bgr_color(color, line_alpha), 2)
+    for kp_pt, score in zip(kp, sc):
+        kp_alpha = confidence_to_alpha(float(score))
+        if kp_alpha <= 0.0:
+            continue
+        cv2.circle(debug, (int(kp_pt[0]), int(kp_pt[1])), 4, dim_bgr_color(color, kp_alpha), -1)
+
+
 def h36m_confidences_from_coco(scores: np.ndarray) -> np.ndarray:
     """Map COCO 17 confidences to H36M 17 (same pairing as coco2h36m)."""
     c = np.zeros(17, dtype=np.float32)
@@ -81,22 +108,6 @@ def h36m_confidences_from_coco(scores: np.ndarray) -> np.ndarray:
     c[15] = scores[8]
     c[16] = scores[10]
     return c
-
-
-def draw_alpha_circle(img, center, radius, color, alpha):
-    if alpha <= 0.0:
-        return
-    overlay = img.copy()
-    cv2.circle(overlay, center, radius, color, -1)
-    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
-
-
-def draw_alpha_line(img, pt1, pt2, color, thickness, alpha):
-    if alpha <= 0.0:
-        return
-    overlay = img.copy()
-    cv2.line(overlay, pt1, pt2, color, thickness)
-    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
 
 
 def coco2h36m(x: np.ndarray) -> np.ndarray:
@@ -210,6 +221,7 @@ class Pose3DNode(Node):
         self._process_lock = threading.Lock()
         self._cv_bridge = CvBridge() if CvBridge is not None else None
         self.track_poses: dict[int, list] = {}  # track_id -> list of (17,3) COCO keypoints
+        self._active_marker_ids: set[int] = set()
 
         depth_topic = args.depth_topic
         self.compressed_depth = (
@@ -371,23 +383,43 @@ class Pose3DNode(Node):
         marker_array = MarkerArray()
         clear = Marker()
         clear.action = Marker.DELETEALL
+        clear.ns = "pose3d"
         clear.header.stamp = stamp
         clear.header.frame_id = self._camera_frame_id
         marker_array.markers.append(clear)
 
         if results.boxes.id is None:
+            for mid in self._active_marker_ids:
+                del_m = Marker()
+                del_m.header.stamp = stamp
+                del_m.header.frame_id = self._camera_frame_id
+                del_m.ns = "pose3d"
+                del_m.id = mid
+                del_m.action = Marker.DELETE
+                marker_array.markers.append(del_m)
+            self._active_marker_ids.clear()
             self._pub_markers.publish(marker_array)
             self._publish_debug_image(stamp, self._camera_frame_id, debug)
             return
 
         track_ids = results.boxes.id.int().cpu().numpy()
         boxes = results.boxes.xyxy.cpu().numpy()
+        box_confs = results.boxes.conf.cpu().numpy()
         keypoints_all = results.keypoints.xy.cpu().numpy()
         scores_all = results.keypoints.conf.cpu().numpy()
 
+        # One entry per track id (YOLO can occasionally repeat an id in one frame).
+        best_idx_for_tid: dict[int, int] = {}
         for i, tid_raw in enumerate(track_ids):
             tid = int(tid_raw)
-            color = get_track_color(tid)
+            if tid not in best_idx_for_tid or box_confs[i] > box_confs[best_idx_for_tid[tid]]:
+                best_idx_for_tid[tid] = i
+        frame_indices = list(best_idx_for_tid.values())
+        track_colors = {tid: get_track_color(tid) for tid in best_idx_for_tid}
+
+        for i in frame_indices:
+            tid = int(track_ids[i])
+            color = track_colors[tid]
             x1, y1, x2, y2 = boxes[i].astype(int)
             cv2.rectangle(debug, (x1, y1), (x2, y2), color, 3)
             label = f"ID:{tid}"
@@ -399,27 +431,12 @@ class Pose3DNode(Node):
                 debug, label, (x1, max(y1 - 8, th + 4)),
                 font, font_scale, color, thickness,
             )
-            kp = keypoints_all[i]
-            sc = scores_all[i]
-            for j, k in COCO_SKELETON:
-                line_alpha = confidence_to_alpha(min(float(sc[j]), float(sc[k])))
-                if line_alpha <= 0.0:
-                    continue
-                pt1 = tuple(kp[j].astype(int))
-                pt2 = tuple(kp[k].astype(int))
-                draw_alpha_line(debug, pt1, pt2, color, 2, line_alpha)
-            for kp_pt, score in zip(kp, sc):
-                kp_alpha = confidence_to_alpha(float(score))
-                if kp_alpha <= 0.0:
-                    continue
-                draw_alpha_circle(
-                    debug, (int(kp_pt[0]), int(kp_pt[1])), 4, color, kp_alpha
-                )
+            draw_person_2d(debug, keypoints_all[i], scores_all[i], color)
 
         infer_ids, infer_inputs, torso_targets, infer_scores = [], [], [], []
 
-        for i, tid in enumerate(track_ids):
-            tid = int(tid)
+        for i in frame_indices:
+            tid = int(track_ids[i])
             kp_xy = keypoints_all[i]
             kp_sc = scores_all[i]
             coco_pose = np.concatenate([kp_xy, kp_sc[:, None]], axis=1).astype(np.float32)
@@ -449,6 +466,7 @@ class Pose3DNode(Node):
             torso_targets.append(torso_3d)
             infer_scores.append(kp_sc)
 
+        new_marker_ids: set[int] = set()
         if infer_inputs:
             batch = np.stack(infer_inputs, axis=0)
             joints_batch = self._motionbert_infer(batch)
@@ -458,17 +476,19 @@ class Pose3DNode(Node):
             ):
                 joints_3d = scale_skeleton_to_meters(joints_3d)
                 joints_3d = place_skeleton_in_camera(joints_3d, torso_3d)
-                b, g, r = get_track_color(tid)
+                b, g, r = track_colors[tid]
                 h36m_conf = h36m_confidences_from_coco(kp_sc)
                 for j_idx, xyz in enumerate(joints_3d):
                     alpha = confidence_to_alpha(float(h36m_conf[j_idx]))
                     if alpha <= 0.0:
                         continue
+                    marker_id = tid * 100 + j_idx
+                    new_marker_ids.add(marker_id)
                     m = Marker()
                     m.header.stamp = stamp
                     m.header.frame_id = self._camera_frame_id
                     m.ns = "pose3d"
-                    m.id = tid * 100 + j_idx
+                    m.id = marker_id
                     m.type = Marker.SPHERE
                     m.action = Marker.ADD
                     m.pose.position.x = float(xyz[0])
@@ -482,11 +502,21 @@ class Pose3DNode(Node):
                     m.color.a = alpha
                     marker_array.markers.append(m)
 
+        for mid in self._active_marker_ids - new_marker_ids:
+            del_m = Marker()
+            del_m.header.stamp = stamp
+            del_m.header.frame_id = self._camera_frame_id
+            del_m.ns = "pose3d"
+            del_m.id = mid
+            del_m.action = Marker.DELETE
+            marker_array.markers.append(del_m)
+        self._active_marker_ids = new_marker_ids
+
         self._pub_markers.publish(marker_array)
         self._publish_debug_image(stamp, self._camera_frame_id, debug)
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.get_logger().info(
-            f"{len(track_ids)} tracks | {len(infer_inputs)} posed | {dt_ms:.1f} ms"
+            f"{len(frame_indices)} tracks | {len(infer_inputs)} posed | {dt_ms:.1f} ms"
         )
 
 
