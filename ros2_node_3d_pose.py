@@ -296,6 +296,7 @@ class Pose3DNode(Node):
     def _process_frame(self, bgr: np.ndarray, depth_raw: np.ndarray, stamp):
         t0 = time.perf_counter()
         results = self.pose_model.track(bgr, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
+        self.get_logger().info(f"Got {len(results.boxes.id)} tracks")
 
         marker_array = MarkerArray()
         clear = Marker()
