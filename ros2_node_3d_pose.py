@@ -44,6 +44,59 @@ H36M_TORSO = 8  # thorax (mid-shoulders)
 TARGET_LIMB_LENGTH_M = 1.5
 MARKER_DIAMETER_M = 0.10
 SEQ_LEN = 15
+CONF_ALPHA_MIN = 0.5
+
+COCO_SKELETON = [
+    [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
+    [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9],
+    [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
+]
+
+
+def confidence_to_alpha(conf: float) -> float:
+    """Map 2D keypoint confidence to display alpha; zero below CONF_ALPHA_MIN."""
+    if conf < CONF_ALPHA_MIN:
+        return 0.0
+    return min(1.0, (conf - CONF_ALPHA_MIN) / (1.0 - CONF_ALPHA_MIN))
+
+
+def h36m_confidences_from_coco(scores: np.ndarray) -> np.ndarray:
+    """Map COCO 17 confidences to H36M 17 (same pairing as coco2h36m)."""
+    c = np.zeros(17, dtype=np.float32)
+    c[0] = 0.5 * (scores[11] + scores[12])
+    c[1] = scores[12]
+    c[2] = scores[14]
+    c[3] = scores[16]
+    c[4] = scores[11]
+    c[5] = scores[13]
+    c[6] = scores[15]
+    c[8] = 0.5 * (scores[5] + scores[6])
+    c[7] = 0.5 * (c[0] + c[8])
+    c[9] = scores[0]
+    c[10] = 0.5 * (scores[1] + scores[2])
+    c[11] = scores[5]
+    c[12] = scores[7]
+    c[13] = scores[9]
+    c[14] = scores[6]
+    c[15] = scores[8]
+    c[16] = scores[10]
+    return c
+
+
+def draw_alpha_circle(img, center, radius, color, alpha):
+    if alpha <= 0.0:
+        return
+    overlay = img.copy()
+    cv2.circle(overlay, center, radius, color, -1)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+
+
+def draw_alpha_line(img, pt1, pt2, color, thickness, alpha):
+    if alpha <= 0.0:
+        return
+    overlay = img.copy()
+    cv2.line(overlay, pt1, pt2, color, thickness)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
 
 
 def coco2h36m(x: np.ndarray) -> np.ndarray:
@@ -346,8 +399,24 @@ class Pose3DNode(Node):
                 debug, label, (x1, max(y1 - 8, th + 4)),
                 font, font_scale, color, thickness,
             )
+            kp = keypoints_all[i]
+            sc = scores_all[i]
+            for j, k in COCO_SKELETON:
+                line_alpha = confidence_to_alpha(min(float(sc[j]), float(sc[k])))
+                if line_alpha <= 0.0:
+                    continue
+                pt1 = tuple(kp[j].astype(int))
+                pt2 = tuple(kp[k].astype(int))
+                draw_alpha_line(debug, pt1, pt2, color, 2, line_alpha)
+            for kp_pt, score in zip(kp, sc):
+                kp_alpha = confidence_to_alpha(float(score))
+                if kp_alpha <= 0.0:
+                    continue
+                draw_alpha_circle(
+                    debug, (int(kp_pt[0]), int(kp_pt[1])), 4, color, kp_alpha
+                )
 
-        infer_ids, infer_inputs, torso_targets = [], [], []
+        infer_ids, infer_inputs, torso_targets, infer_scores = [], [], [], []
 
         for i, tid in enumerate(track_ids):
             tid = int(tid)
@@ -378,16 +447,23 @@ class Pose3DNode(Node):
             infer_ids.append(tid)
             infer_inputs.append(h36m_seq)
             torso_targets.append(torso_3d)
+            infer_scores.append(kp_sc)
 
         if infer_inputs:
             batch = np.stack(infer_inputs, axis=0)
             joints_batch = self._motionbert_infer(batch)
 
-            for tid, joints_3d, torso_3d in zip(infer_ids, joints_batch, torso_targets):
+            for tid, joints_3d, torso_3d, kp_sc in zip(
+                infer_ids, joints_batch, torso_targets, infer_scores
+            ):
                 joints_3d = scale_skeleton_to_meters(joints_3d)
                 joints_3d = place_skeleton_in_camera(joints_3d, torso_3d)
                 b, g, r = get_track_color(tid)
+                h36m_conf = h36m_confidences_from_coco(kp_sc)
                 for j_idx, xyz in enumerate(joints_3d):
+                    alpha = confidence_to_alpha(float(h36m_conf[j_idx]))
+                    if alpha <= 0.0:
+                        continue
                     m = Marker()
                     m.header.stamp = stamp
                     m.header.frame_id = self._camera_frame_id
@@ -403,7 +479,7 @@ class Pose3DNode(Node):
                     m.color.r = r / 255.0
                     m.color.g = g / 255.0
                     m.color.b = b / 255.0
-                    m.color.a = 1.0
+                    m.color.a = alpha
                     marker_array.markers.append(m)
 
         self._pub_markers.publish(marker_array)
