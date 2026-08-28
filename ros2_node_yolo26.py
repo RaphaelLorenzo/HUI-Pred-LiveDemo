@@ -11,7 +11,6 @@ In Docker (ROS Humble uses Python 3.10), run with:
 """
 
 import argparse
-import math
 import threading
 import types
 import time
@@ -86,8 +85,6 @@ COCO_SKELETON = [
     [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
 ]
 
-TORSO_MARKER_HEIGHT_M = 1.8
-TORSO_MARKER_BASE_OFFSET_M = 1.5
 TORSO_MARKER_DIAMETER_M = 0.5
 
 METADATA_CKPT_COLUMNS = [
@@ -538,7 +535,7 @@ class HUIPredNode(Node):
             Float32MultiArray, "/huipred/tracks", 10
         )
 
-        # -- Publisher: /huipred/torso_markers (3D torso cylinders colored by IP score) --
+        # -- Publisher: /huipred/torso_markers (3D torso spheres colored by IP score) --
         self._pub_torso_markers = self.create_publisher(
             MarkerArray, "/huipred/torso_markers", 10
         )
@@ -825,33 +822,28 @@ class HUIPredNode(Node):
         return 1.0 - value, value, 0.0, 1.0
 
     @staticmethod
-    def _make_torso_cylinder_marker(
+    def _make_torso_sphere_marker(
         stamp,
         frame_id: str,
         track_id: int,
         torso_xyz: np.ndarray,
         ip_score: float | None,
     ) -> Marker:
-        """Build a vertical cylinder marker with its base 1.5 m below the torso."""
+        """Build a sphere marker centered on the torso 3D position."""
         marker = Marker()
         marker.header.stamp = stamp
         marker.header.frame_id = frame_id
         marker.ns = "huipred_torso"
         marker.id = track_id
-        marker.type = Marker.CYLINDER
+        marker.type = Marker.SPHERE
         marker.action = Marker.ADD
         marker.pose.position.x = float(torso_xyz[0])
-        marker.pose.position.y = float(torso_xyz[1]) + (
-            TORSO_MARKER_BASE_OFFSET_M - TORSO_MARKER_HEIGHT_M / 2.0
-        )
+        marker.pose.position.y = float(torso_xyz[1])
         marker.pose.position.z = float(torso_xyz[2])
-        # Cylinder default axis is local Z; rotate to camera optical Y (down).
-        half_turn = math.pi / 2.0
-        marker.pose.orientation.x = math.sin(half_turn / 2.0)
-        marker.pose.orientation.w = math.cos(half_turn / 2.0)
+        marker.pose.orientation.w = 1.0
         marker.scale.x = TORSO_MARKER_DIAMETER_M
         marker.scale.y = TORSO_MARKER_DIAMETER_M
-        marker.scale.z = TORSO_MARKER_HEIGHT_M
+        marker.scale.z = TORSO_MARKER_DIAMETER_M
         red, green, blue, alpha = HUIPredNode._ip_score_to_marker_rgba(ip_score)
         marker.color.r = red
         marker.color.g = green
@@ -1268,7 +1260,7 @@ class HUIPredNode(Node):
             tracks_msg.data = tracks_data
             self._pub_tracks.publish(tracks_msg)
 
-            # Publish valid torso positions as colored cylinder markers.
+            # Publish valid torso positions as colored sphere markers.
             stamp = self.get_clock().now().to_msg()
             torso_markers_msg = MarkerArray()
             clear_marker = Marker()
@@ -1284,7 +1276,7 @@ class HUIPredNode(Node):
                 if tid in self.track_history:
                     ip_score = self._latest_ip_score(self.track_history[tid])
                 torso_markers_msg.markers.append(
-                    self._make_torso_cylinder_marker(
+                    self._make_torso_sphere_marker(
                         stamp,
                         self._camera_frame_id,
                         tid,
