@@ -91,9 +91,9 @@ COCO_SKELETON = [
     [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
 ]
 
-PERSON_ARROW_LENGTH_M = 1.8
-PERSON_ARROW_SHAFT_DIAMETER_M = 0.5
-PERSON_ARROW_HEAD_DIAMETER_M = 0.5
+PERSON_CUBE_DEPTH_M = 0.3
+PERSON_CUBE_WIDTH_M = 0.6
+PERSON_CUBE_HEIGHT_M = 1.8
 LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
 
 METADATA_CKPT_COLUMNS = [
@@ -204,34 +204,95 @@ def _sample_depth_m_at_pixel(
     return fallback_depth_m
 
 
-def _quaternion_from_x_to_direction(direction: np.ndarray) -> tuple[float, float, float, float]:
-    """Quaternion (x, y, z, w) rotating marker +X axis to direction."""
-    direction = np.asarray(direction, dtype=np.float32)
-    direction[1] = 0.0
-    norm = float(np.linalg.norm(direction))
-    if norm < 1e-6:
-        return 0.0, 0.0, 0.0, 1.0
-    direction /= norm
-    source = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    dot = float(np.clip(np.dot(source, direction), -1.0, 1.0))
-    if dot > 1.0 - 1e-8:
-        return 0.0, 0.0, 0.0, 1.0
-    if dot < -1.0 + 1e-8:
-        return 0.0, 1.0, 0.0, 0.0
-    axis = np.cross(source, direction)
-    axis_norm = float(np.linalg.norm(axis))
-    if axis_norm < 1e-8:
-        return 0.0, 0.0, 0.0, 1.0
-    axis /= axis_norm
-    angle = float(np.arccos(dot))
-    half = angle / 2.0
-    s = float(np.sin(half))
+def _quaternion_from_rotation_matrix(rot: np.ndarray) -> tuple[float, float, float, float]:
+    """Quaternion (x, y, z, w) from a 3x3 rotation matrix (local-to-parent)."""
+    m = np.asarray(rot, dtype=np.float64)
+    trace = float(m[0, 0] + m[1, 1] + m[2, 2])
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        return (
+            float((m[2, 1] - m[1, 2]) / s),
+            float((m[0, 2] - m[2, 0]) / s),
+            float((m[1, 0] - m[0, 1]) / s),
+            float(0.25 * s),
+        )
+    if m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        return (
+            float(0.25 * s),
+            float((m[0, 1] + m[1, 0]) / s),
+            float((m[0, 2] + m[2, 0]) / s),
+            float((m[2, 1] - m[1, 2]) / s),
+        )
+    if m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        return (
+            float((m[0, 1] + m[1, 0]) / s),
+            float(0.25 * s),
+            float((m[1, 2] + m[2, 1]) / s),
+            float((m[0, 2] - m[2, 0]) / s),
+        )
+    s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
     return (
-        float(axis[0] * s),
-        float(axis[1] * s),
-        float(axis[2] * s),
-        float(np.cos(half)),
+        float((m[0, 2] + m[2, 0]) / s),
+        float((m[1, 2] + m[2, 1]) / s),
+        float(0.25 * s),
+        float((m[1, 0] - m[0, 1]) / s),
     )
+
+
+def _body_orientation_from_shoulders(
+    left_3d: np.ndarray | None,
+    right_3d: np.ndarray | None,
+    shoulder_2d: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return orthonormal width, forward, and up axes for a yaw-only body frame."""
+    up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+
+    if left_3d is not None and right_3d is not None:
+        width_dir = left_3d - right_3d
+        width_dir[1] = 0.0
+        width_norm = float(np.linalg.norm(width_dir))
+        if width_norm < 1e-6:
+            return None
+        width_dir /= width_norm
+        forward_dir = np.cross(width_dir, up_cam)
+    else:
+        facing_2d = np.array([-shoulder_2d[1], shoulder_2d[0]], dtype=np.float32)
+        forward_dir = np.array([facing_2d[0], 0.0, facing_2d[1]], dtype=np.float32)
+        forward_norm = float(np.linalg.norm(forward_dir))
+        if forward_norm < 1e-6:
+            return None
+        forward_dir /= forward_norm
+        width_dir = np.cross(forward_dir, up_cam)
+
+    width_norm = float(np.linalg.norm(width_dir))
+    if width_norm < 1e-6:
+        return None
+    width_dir /= width_norm
+    forward_dir[1] = 0.0
+    forward_norm = float(np.linalg.norm(forward_dir))
+    if forward_norm < 1e-6:
+        return None
+    forward_dir /= forward_norm
+    return width_dir, forward_dir, up_cam
+
+
+def _quaternion_from_body_axes(
+    width_dir: np.ndarray,
+    forward_dir: np.ndarray,
+    up_dir: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """Quaternion aligning local X=width, Y=depth/forward, Z=height/up."""
+    rot = np.stack(
+        [
+            np.asarray(width_dir, dtype=np.float32),
+            np.asarray(forward_dir, dtype=np.float32),
+            np.asarray(up_dir, dtype=np.float32),
+        ],
+        axis=1,
+    )
+    return _quaternion_from_rotation_matrix(rot)
 
 
 def compute_person_pose_from_shoulders(
@@ -270,19 +331,10 @@ def compute_person_pose_from_shoulders(
         else None
     )
 
-    if left_3d is not None and right_3d is not None:
-        shoulder_vec = left_3d - right_3d
-        up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-        forward = np.cross(up_cam, shoulder_vec)
-    else:
-        facing_2d = np.array([-shoulder_2d[1], shoulder_2d[0]], dtype=np.float32)
-        forward = np.array([facing_2d[0], 0.0, facing_2d[1]], dtype=np.float32)
-
-    forward[1] = 0.0
-    forward_norm = float(np.linalg.norm(forward))
-    if forward_norm < 1e-6:
+    axes = _body_orientation_from_shoulders(left_3d, right_3d, shoulder_2d)
+    if axes is None:
         return None
-    forward /= forward_norm
+    width_dir, forward_dir, up_dir = axes
 
     position = None
     if torso_center_uv is not None and torso_depth_m is not None and camera_matrix is not None:
@@ -290,7 +342,7 @@ def compute_person_pose_from_shoulders(
     elif left_3d is not None and right_3d is not None:
         position = 0.5 * (left_3d + right_3d)
 
-    quat = _quaternion_from_x_to_direction(forward)
+    quat = _quaternion_from_body_axes(width_dir, forward_dir, up_dir)
     bbox_theta = float(np.arctan2(-shoulder_2d[1], shoulder_2d[0]) + (np.pi / 2.0))
     return {
         "position": position,
@@ -656,7 +708,7 @@ class HUIPredNode(Node):
             Float32MultiArray, "/huipred/tracks", 10
         )
 
-        # -- Publisher: /huipred/torso_markers (oriented person arrows colored by IP score) --
+        # -- Publisher: /huipred/torso_markers (oriented person cubes colored by IP score) --
         self._pub_torso_markers = self.create_publisher(
             MarkerArray, "/huipred/torso_markers", 10
         )
@@ -948,7 +1000,7 @@ class HUIPredNode(Node):
         return 1.0 - value, value, 0.0, 1.0
 
     @staticmethod
-    def _make_person_arrow_marker(
+    def _make_person_cube_marker(
         stamp,
         frame_id: str,
         track_id: int,
@@ -956,13 +1008,13 @@ class HUIPredNode(Node):
         orientation_xyzw: tuple[float, float, float, float],
         ip_score: float | None,
     ) -> Marker:
-        """Build a horizontal arrow marker at the torso showing person yaw."""
+        """Build a human-sized cube marker at the torso, oriented with body yaw."""
         marker = Marker()
         marker.header.stamp = stamp
         marker.header.frame_id = frame_id
         marker.ns = "huipred_torso"
         marker.id = track_id
-        marker.type = Marker.ARROW
+        marker.type = Marker.CUBE
         marker.action = Marker.ADD
         marker.pose.position.x = float(position_xyz[0])
         marker.pose.position.y = float(position_xyz[1])
@@ -972,9 +1024,9 @@ class HUIPredNode(Node):
         marker.pose.orientation.y = qy
         marker.pose.orientation.z = qz
         marker.pose.orientation.w = qw
-        marker.scale.x = PERSON_ARROW_LENGTH_M
-        marker.scale.y = PERSON_ARROW_SHAFT_DIAMETER_M
-        marker.scale.z = PERSON_ARROW_HEAD_DIAMETER_M
+        marker.scale.x = PERSON_CUBE_WIDTH_M
+        marker.scale.y = PERSON_CUBE_DEPTH_M
+        marker.scale.z = PERSON_CUBE_HEIGHT_M
         red, green, blue, alpha = HUIPredNode._ip_score_to_marker_rgba(ip_score)
         marker.color.r = red
         marker.color.g = green
@@ -1462,7 +1514,7 @@ class HUIPredNode(Node):
             tracks_msg.data = tracks_data
             self._pub_tracks.publish(tracks_msg)
 
-            # Publish oriented person arrows for valid shoulder-based poses.
+            # Publish oriented person cubes for valid shoulder-based poses.
             stamp = image_stamp
             torso_markers_msg = MarkerArray()
             clear_marker = Marker()
@@ -1480,7 +1532,7 @@ class HUIPredNode(Node):
                 if tid in self.track_history:
                     ip_score = self._latest_ip_score(self.track_history[tid])
                 torso_markers_msg.markers.append(
-                    self._make_person_arrow_marker(
+                    self._make_person_cube_marker(
                         stamp,
                         self._camera_frame_id,
                         tid,

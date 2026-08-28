@@ -122,7 +122,7 @@ Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
 
 - `/huipred/torso_markers`  
   **Type:** `visualization_msgs/msg/MarkerArray`  
-  **Description:** Oriented `ARROW` markers at each valid person pose (same shoulder validity rules as `/huipred/tracks_detections2d`). Arrow length is 1.8 m, shaft/head diameter is 0.5 m, color encodes IP score (gray when unavailable, red→green for 0→1). Timestamps match the input RGB image.
+  **Description:** Oriented `CUBE` markers at each valid person pose (same shoulder validity rules as `/huipred/tracks_detections2d`). Cube dimensions are 0.6 m wide, 0.3 m deep, and 1.8 m high (local X/Y/Z), aligned with body yaw. Color encodes IP score (gray when unavailable, red→green for 0→1). Timestamps match the input RGB image.
 
 - `/huipred/torso_poses`  
   **Type:** `geometry_msgs/msg/PoseArray`  
