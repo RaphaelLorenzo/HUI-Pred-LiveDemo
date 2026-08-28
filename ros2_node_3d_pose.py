@@ -182,7 +182,10 @@ class Pose3DNode(Node):
             num_joints=mb_config["num_joints"],
         )
         checkpoint = torch.load(args.motionbert_checkpoint, map_location="cpu")
-        self.mb_model.load_state_dict(checkpoint["model_pos"], strict=True)
+        state_dict = checkpoint["model_pos"]
+        if any(k.startswith("module.") for k in state_dict):
+            state_dict = {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+        self.mb_model.load_state_dict(state_dict, strict=True)
         self.mb_model.eval()
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.mb_model.to(self._device)
