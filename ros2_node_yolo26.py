@@ -241,41 +241,62 @@ def _quaternion_from_rotation_matrix(rot: np.ndarray) -> tuple[float, float, flo
     )
 
 
-def _body_orientation_from_shoulders(
+def _normalize_horizontal_axis(axis: np.ndarray) -> np.ndarray | None:
+    """Keep only the camera X/Z components (Y is down in the optical frame)."""
+    axis = np.asarray(axis, dtype=np.float32).copy()
+    axis[1] = 0.0
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-6:
+        return None
+    return axis / norm
+
+
+def _body_orientation_from_width(width_dir: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Build a right-handed body frame in the optical frame (x right, y down, z front).
+
+    Local axes used by the cube marker:
+    - X: width (shoulder line, horizontal)
+    - Y: depth (body forward)
+    - Z: height (up = -camera Y)
+    """
+    up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+    width_dir = _normalize_horizontal_axis(width_dir)
+    if width_dir is None:
+        return None
+    forward_dir = np.cross(up_cam, width_dir)
+    forward_dir = _normalize_horizontal_axis(forward_dir)
+    if forward_dir is None:
+        return None
+    return width_dir, forward_dir, up_cam
+
+
+def _width_dir_from_shoulders(
+    left_uv: np.ndarray,
+    right_uv: np.ndarray,
     left_3d: np.ndarray | None,
     right_3d: np.ndarray | None,
-    shoulder_2d: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Return orthonormal width, forward, and up axes for a yaw-only body frame."""
-    up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-
+    torso_depth_m: float | None,
+    camera_matrix: np.ndarray | None,
+) -> np.ndarray | None:
+    """Estimate the horizontal shoulder-width axis in the camera optical frame."""
     if left_3d is not None and right_3d is not None:
-        width_dir = left_3d - right_3d
-        width_dir[1] = 0.0
-        width_norm = float(np.linalg.norm(width_dir))
-        if width_norm < 1e-6:
-            return None
-        width_dir /= width_norm
-        forward_dir = np.cross(width_dir, up_cam)
-    else:
-        facing_2d = np.array([-shoulder_2d[1], shoulder_2d[0]], dtype=np.float32)
-        forward_dir = np.array([facing_2d[0], 0.0, facing_2d[1]], dtype=np.float32)
-        forward_norm = float(np.linalg.norm(forward_dir))
-        if forward_norm < 1e-6:
-            return None
-        forward_dir /= forward_norm
-        width_dir = np.cross(forward_dir, up_cam)
+        return _normalize_horizontal_axis(left_3d - right_3d)
 
-    width_norm = float(np.linalg.norm(width_dir))
-    if width_norm < 1e-6:
+    if (
+        torso_depth_m is not None
+        and torso_depth_m > 0.0
+        and camera_matrix is not None
+    ):
+        left_3d_est = project_pixel_to_3d(left_uv, torso_depth_m, camera_matrix)
+        right_3d_est = project_pixel_to_3d(right_uv, torso_depth_m, camera_matrix)
+        if left_3d_est is not None and right_3d_est is not None:
+            return _normalize_horizontal_axis(left_3d_est - right_3d_est)
+
+    shoulder_2d = right_uv - left_uv
+    if float(np.linalg.norm(shoulder_2d)) < 1e-6:
         return None
-    width_dir /= width_norm
-    forward_dir[1] = 0.0
-    forward_norm = float(np.linalg.norm(forward_dir))
-    if forward_norm < 1e-6:
-        return None
-    forward_dir /= forward_norm
-    return width_dir, forward_dir, up_cam
+    # Pixel u maps to camera +X; ignore dv for yaw-only orientation.
+    return _normalize_horizontal_axis(np.array([shoulder_2d[0], 0.0, 0.0], dtype=np.float32))
 
 
 def _quaternion_from_body_axes(
@@ -292,6 +313,9 @@ def _quaternion_from_body_axes(
         ],
         axis=1,
     )
+    if float(np.linalg.det(rot)) < 0.0:
+        forward_dir = -np.asarray(forward_dir, dtype=np.float32)
+        rot[:, 1] = forward_dir
     return _quaternion_from_rotation_matrix(rot)
 
 
@@ -314,9 +338,6 @@ def compute_person_pose_from_shoulders(
 
     left_uv = np.asarray(keypoints[LEFT_SHOULDER], dtype=np.float32)
     right_uv = np.asarray(keypoints[RIGHT_SHOULDER], dtype=np.float32)
-    shoulder_2d = right_uv - left_uv
-    if float(np.linalg.norm(shoulder_2d)) < 1e-6:
-        return None
 
     left_depth_m = _sample_depth_m_at_pixel(left_uv, depth_image, depth_scale, torso_depth_m)
     right_depth_m = _sample_depth_m_at_pixel(right_uv, depth_image, depth_scale, torso_depth_m)
@@ -331,7 +352,15 @@ def compute_person_pose_from_shoulders(
         else None
     )
 
-    axes = _body_orientation_from_shoulders(left_3d, right_3d, shoulder_2d)
+    width_dir = _width_dir_from_shoulders(
+        left_uv,
+        right_uv,
+        left_3d,
+        right_3d,
+        torso_depth_m,
+        camera_matrix,
+    )
+    axes = _body_orientation_from_width(width_dir) if width_dir is not None else None
     if axes is None:
         return None
     width_dir, forward_dir, up_dir = axes
@@ -343,6 +372,7 @@ def compute_person_pose_from_shoulders(
         position = 0.5 * (left_3d + right_3d)
 
     quat = _quaternion_from_body_axes(width_dir, forward_dir, up_dir)
+    shoulder_2d = right_uv - left_uv
     bbox_theta = float(np.arctan2(-shoulder_2d[1], shoulder_2d[0]) + (np.pi / 2.0))
     return {
         "position": position,
