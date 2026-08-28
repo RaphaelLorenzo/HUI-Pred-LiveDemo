@@ -259,7 +259,10 @@ class Pose3DNode(Node):
         self.mb_flip = bool(mb_config.get("flip", True))
 
         self._pub_markers = self.create_publisher(MarkerArray, args.marker_topic, 10)
-        self._pub_debug = self.create_publisher(RosImage, args.debug_image_topic, 10)
+        self._debug_enabled = args.debug_image_topic.lower() != "none"
+        self._pub_debug = None
+        if self._debug_enabled:
+            self._pub_debug = self.create_publisher(RosImage, args.debug_image_topic, 10)
 
         self.create_subscription(
             CameraInfo, args.camera_info_topic, self._camera_info_cb, 10
@@ -275,7 +278,7 @@ class Pose3DNode(Node):
         sync.registerCallback(self._synced_cb)
         self.get_logger().info(
             f"Ready | RGB={args.rgb_topic} depth={depth_topic} "
-            f"markers={args.marker_topic} debug={args.debug_image_topic}"
+            f"markers={args.marker_topic} debug={'off' if not self._debug_enabled else args.debug_image_topic}"
         )
 
     def _camera_info_cb(self, msg: CameraInfo):
@@ -362,6 +365,8 @@ class Pose3DNode(Node):
         return pred[:, -1].cpu().numpy()
 
     def _publish_debug_image(self, stamp, frame_id: str, bgr: np.ndarray):
+        if not self._debug_enabled or self._pub_debug is None:
+            return
         img = np.ascontiguousarray(bgr, dtype=np.uint8)
         if img.ndim != 3 or img.shape[2] != 3:
             return
@@ -379,7 +384,7 @@ class Pose3DNode(Node):
         t0 = time.perf_counter()
         results = self.pose_model.track(bgr, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
 
-        debug = bgr.copy()
+        debug = bgr.copy() if self._debug_enabled else None
         marker_array = MarkerArray()
         clear = Marker()
         clear.action = Marker.DELETEALL
@@ -399,7 +404,8 @@ class Pose3DNode(Node):
                 marker_array.markers.append(del_m)
             self._active_marker_ids.clear()
             self._pub_markers.publish(marker_array)
-            self._publish_debug_image(stamp, self._camera_frame_id, debug)
+            if debug is not None:
+                self._publish_debug_image(stamp, self._camera_frame_id, debug)
             return
 
         track_ids = results.boxes.id.int().cpu().numpy()
@@ -417,21 +423,22 @@ class Pose3DNode(Node):
         frame_indices = list(best_idx_for_tid.values())
         track_colors = {tid: get_track_color(tid) for tid in best_idx_for_tid}
 
-        for i in frame_indices:
-            tid = int(track_ids[i])
-            color = track_colors[tid]
-            x1, y1, x2, y2 = boxes[i].astype(int)
-            cv2.rectangle(debug, (x1, y1), (x2, y2), color, 3)
-            label = f"ID:{tid}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.8
-            thickness = 2
-            (_, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
-            cv2.putText(
-                debug, label, (x1, max(y1 - 8, th + 4)),
-                font, font_scale, color, thickness,
-            )
-            draw_person_2d(debug, keypoints_all[i], scores_all[i], color)
+        if debug is not None:
+            for i in frame_indices:
+                tid = int(track_ids[i])
+                color = track_colors[tid]
+                x1, y1, x2, y2 = boxes[i].astype(int)
+                cv2.rectangle(debug, (x1, y1), (x2, y2), color, 3)
+                label = f"ID:{tid}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.8
+                thickness = 2
+                (_, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                cv2.putText(
+                    debug, label, (x1, max(y1 - 8, th + 4)),
+                    font, font_scale, color, thickness,
+                )
+                draw_person_2d(debug, keypoints_all[i], scores_all[i], color)
 
         infer_ids, infer_inputs, torso_targets, infer_scores = [], [], [], []
 
@@ -513,7 +520,8 @@ class Pose3DNode(Node):
         self._active_marker_ids = new_marker_ids
 
         self._pub_markers.publish(marker_array)
-        self._publish_debug_image(stamp, self._camera_frame_id, debug)
+        if debug is not None:
+            self._publish_debug_image(stamp, self._camera_frame_id, debug)
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.get_logger().info(
             f"{len(frame_indices)} tracks | {len(infer_inputs)} posed | {dt_ms:.1f} ms"
@@ -563,6 +571,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--debug_image_topic", type=str, default="/huipred/pose3d_debug/image_raw",
+        help='Debug overlay topic, or "none" to disable',
     )
     parser.add_argument("--kp_thresh", type=float, default=0.3)
     parser.add_argument("--depth_scale", type=float, default=1000.0)
