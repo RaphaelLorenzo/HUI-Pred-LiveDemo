@@ -3,7 +3,8 @@
 ROS2 node for 3D human pose via YOLO26 tracking + MotionBERT lifting.
 
 Subscribes to RGB, depth, and camera_info, publishes sphere markers for each
-H36M joint in the camera optical frame on /huipred/pose3d_markers.
+H36M joint in the camera optical frame on /huipred/pose3d_markers, and a debug
+2D overlay on /huipred/pose3d_debug/compressed.
 
 Run (Docker / ROS Humble, Python 3.10):
     python3.10 ros2_node_3d_pose.py
@@ -193,6 +194,7 @@ class Pose3DNode(Node):
         self.mb_flip = bool(mb_config.get("flip", True))
 
         self._pub_markers = self.create_publisher(MarkerArray, args.marker_topic, 10)
+        self._pub_debug = self.create_publisher(CompressedImage, args.debug_image_topic, 10)
 
         self.create_subscription(
             CameraInfo, args.camera_info_topic, self._camera_info_cb, 10
@@ -207,7 +209,8 @@ class Pose3DNode(Node):
         )
         sync.registerCallback(self._synced_cb)
         self.get_logger().info(
-            f"Ready | RGB={args.rgb_topic} depth={depth_topic} markers={args.marker_topic}"
+            f"Ready | RGB={args.rgb_topic} depth={depth_topic} "
+            f"markers={args.marker_topic} debug={args.debug_image_topic}"
         )
 
     def _camera_info_cb(self, msg: CameraInfo):
@@ -293,14 +296,23 @@ class Pose3DNode(Node):
                 pred[:, :, 0, :] = 0.0
         return pred[:, -1].cpu().numpy()
 
+    @staticmethod
+    def _publish_debug_image(pub, stamp, frame_id: str, bgr: np.ndarray):
+        ok, encoded = cv2.imencode(".jpg", bgr)
+        if not ok:
+            return
+        msg = CompressedImage()
+        msg.header.stamp = stamp
+        msg.header.frame_id = frame_id
+        msg.format = "jpeg"
+        msg.data = encoded.tobytes()
+        pub.publish(msg)
+
     def _process_frame(self, bgr: np.ndarray, depth_raw: np.ndarray, stamp):
         t0 = time.perf_counter()
         results = self.pose_model.track(bgr, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
-        if results.boxes.id is None:
-            self.get_logger().warning("No tracks found")
-        else:
-            self.get_logger().info(f"Got {len(results.boxes.id)} tracks")
 
+        debug = bgr.copy()
         marker_array = MarkerArray()
         clear = Marker()
         clear.action = Marker.DELETEALL
@@ -310,11 +322,28 @@ class Pose3DNode(Node):
 
         if results.boxes.id is None:
             self._pub_markers.publish(marker_array)
+            self._publish_debug_image(self._pub_debug, stamp, self._camera_frame_id, debug)
             return
 
         track_ids = results.boxes.id.int().cpu().numpy()
+        boxes = results.boxes.xyxy.cpu().numpy()
         keypoints_all = results.keypoints.xy.cpu().numpy()
         scores_all = results.keypoints.conf.cpu().numpy()
+
+        for i, tid_raw in enumerate(track_ids):
+            tid = int(tid_raw)
+            color = get_track_color(tid)
+            x1, y1, x2, y2 = boxes[i].astype(int)
+            cv2.rectangle(debug, (x1, y1), (x2, y2), color, 3)
+            label = f"ID:{tid}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.8
+            thickness = 2
+            (_, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+            cv2.putText(
+                debug, label, (x1, max(y1 - 8, th + 4)),
+                font, font_scale, color, thickness,
+            )
 
         infer_ids, infer_inputs, torso_targets = [], [], []
 
@@ -376,6 +405,7 @@ class Pose3DNode(Node):
                     marker_array.markers.append(m)
 
         self._pub_markers.publish(marker_array)
+        self._publish_debug_image(self._pub_debug, stamp, self._camera_frame_id, debug)
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.get_logger().info(
             f"{len(track_ids)} tracks | {len(infer_inputs)} posed | {dt_ms:.1f} ms"
@@ -422,6 +452,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--marker_topic", type=str, default="/huipred/pose3d_markers",
+    )
+    parser.add_argument(
+        "--debug_image_topic", type=str, default="/huipred/pose3d_debug/compressed",
     )
     parser.add_argument("--kp_thresh", type=float, default=0.3)
     parser.add_argument("--depth_scale", type=float, default=1000.0)
