@@ -297,17 +297,17 @@ class Pose3DNode(Node):
         return pred[:, -1].cpu().numpy()
 
     def _publish_debug_image(self, stamp, frame_id: str, bgr: np.ndarray):
-        if self._cv_bridge is not None:
-            msg = self._cv_bridge.cv2_to_imgmsg(bgr, encoding="bgr8")
-        else:
-            msg = RosImage()
-            msg.height, msg.width = bgr.shape[:2]
-            msg.encoding = "bgr8"
-            msg.is_bigendian = False
-            msg.step = bgr.shape[1] * 3
-            msg.data = bgr.tobytes()
+        img = np.ascontiguousarray(bgr, dtype=np.uint8)
+        if img.ndim != 3 or img.shape[2] != 3:
+            return
+        msg = RosImage()
         msg.header.stamp = stamp
         msg.header.frame_id = frame_id
+        msg.height, msg.width = img.shape[:2]
+        msg.encoding = "bgr8"
+        msg.is_bigendian = False
+        msg.step = img.shape[1] * 3
+        msg.data = img.tobytes()
         self._pub_debug.publish(msg)
 
     def _process_frame(self, bgr: np.ndarray, depth_raw: np.ndarray, stamp):
