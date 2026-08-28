@@ -985,7 +985,7 @@ class HUIPredNode(Node):
         if depth is None:
             self._log_depth_decode_failure(depth_msg)
             return
-        self._process_frame(bgr, depth)
+        self._process_frame(bgr, depth, rgb_msg.header.stamp)
 
     def _rgb_only_cb(self, rgb_msg: CompressedImage):
         time_elapsed = time.perf_counter() - self._last_received_rgb_time
@@ -995,7 +995,7 @@ class HUIPredNode(Node):
         if bgr is None:
             self.get_logger().warn("Failed to decode RGB message")
             return
-        self._process_frame(bgr, None)
+        self._process_frame(bgr, None, rgb_msg.header.stamp)
 
     # ----- dynamic estimation mode ------------------------------------------
 
@@ -1021,7 +1021,7 @@ class HUIPredNode(Node):
 
     # ----- main per-frame pipeline -------------------------------------------
 
-    def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray):
+    def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray, image_stamp):
         
         if not self._process_lock.acquire(blocking=False):
             self.get_logger().info("Skipping frame — previous frame still processing")
@@ -1036,11 +1036,11 @@ class HUIPredNode(Node):
                 else:
                     self.get_logger().info(f"Processed frame — time difference is enough: {time_elapsed:.4f}s. Will process and reset last processed time.")
                     self._last_processed_rgb_time = time.perf_counter()
-            self._process_frame_locked(bgr, depth_image)
+            self._process_frame_locked(bgr, depth_image, image_stamp)
         finally:
             self._process_lock.release()
 
-    def _process_frame_locked(self, bgr: np.ndarray, depth_image: np.ndarray):
+    def _process_frame_locked(self, bgr: np.ndarray, depth_image: np.ndarray, image_stamp):
         t_start = time.perf_counter()
         t_ip = 0.0
         args = self._args
@@ -1311,9 +1311,11 @@ class HUIPredNode(Node):
             self._pub_tracks.publish(tracks_msg)
 
             # Publish valid torso positions as colored sphere markers.
-            stamp = self.get_clock().now().to_msg()
+            stamp = image_stamp
             torso_markers_msg = MarkerArray()
             clear_marker = Marker()
+            clear_marker.header.stamp = stamp
+            clear_marker.header.frame_id = self._camera_frame_id
             clear_marker.action = Marker.DELETEALL
             clear_marker.ns = "huipred_torso"
             torso_markers_msg.markers.append(clear_marker)
