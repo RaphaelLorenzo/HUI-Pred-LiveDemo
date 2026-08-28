@@ -11,6 +11,7 @@ In Docker (ROS Humble uses Python 3.10), run with:
 """
 
 import argparse
+import math
 import threading
 import types
 import time
@@ -22,8 +23,8 @@ from functools import partial
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
-from geometry_msgs.msg import Pose, PoseArray
 from std_msgs.msg import Float32MultiArray, String
+from visualization_msgs.msg import Marker, MarkerArray
 import message_filters
 
 try:
@@ -84,6 +85,10 @@ COCO_SKELETON = [
     [5, 11], [6, 12], [5, 6], [5, 7], [6, 8], [7, 9],
     [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
 ]
+
+TORSO_MARKER_HEIGHT_M = 1.8
+TORSO_MARKER_BASE_OFFSET_M = 1.5
+TORSO_MARKER_DIAMETER_M = 0.5
 
 METADATA_CKPT_COLUMNS = [
     "recording", "episode", "image_height", "image_width",
@@ -533,9 +538,9 @@ class HUIPredNode(Node):
             Float32MultiArray, "/huipred/tracks", 10
         )
 
-        # -- Publisher: /huipred/torso_poses (valid 3D torso positions only) --
-        self._pub_torso_poses = self.create_publisher(
-            PoseArray, "/huipred/torso_poses", 10
+        # -- Publisher: /huipred/torso_markers (3D torso cylinders colored by IP score) --
+        self._pub_torso_markers = self.create_publisher(
+            MarkerArray, "/huipred/torso_markers", 10
         )
         self._overlay_mode = args.overlay_mode
         self.get_logger().info(f"Overlay mode: {self._overlay_mode}")
@@ -800,6 +805,59 @@ class HUIPredNode(Node):
                 if score > args.kp_thresh:
                     cv2.circle(overlay, (int(kp_pt[0]), int(kp_pt[1])), 4, color, -1)
         return overlay
+
+    @staticmethod
+    def _latest_ip_score(track_history: dict) -> float | None:
+        """Return the latest valid IP score for marker coloring, or None if not computed."""
+        if not track_history.get("ip_output"):
+            return None
+        value = track_history["ip_output"][-1]
+        if isinstance(value, (int, float, np.floating)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _ip_score_to_marker_rgba(ip_score: float | None) -> tuple[float, float, float, float]:
+        """Gray when IP is not computed; red (0) to green (1) otherwise."""
+        if ip_score is None:
+            return 0.5, 0.5, 0.5, 1.0
+        value = max(0.0, min(1.0, float(ip_score)))
+        return 1.0 - value, value, 0.0, 1.0
+
+    @staticmethod
+    def _make_torso_cylinder_marker(
+        stamp,
+        frame_id: str,
+        track_id: int,
+        torso_xyz: np.ndarray,
+        ip_score: float | None,
+    ) -> Marker:
+        """Build a vertical cylinder marker with its base 1.5 m below the torso."""
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = frame_id
+        marker.ns = "huipred_torso"
+        marker.id = track_id
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(torso_xyz[0])
+        marker.pose.position.y = float(torso_xyz[1]) + (
+            TORSO_MARKER_BASE_OFFSET_M - TORSO_MARKER_HEIGHT_M / 2.0
+        )
+        marker.pose.position.z = float(torso_xyz[2])
+        # Cylinder default axis is local Z; rotate to camera optical Y (down).
+        half_turn = math.pi / 2.0
+        marker.pose.orientation.x = math.sin(half_turn / 2.0)
+        marker.pose.orientation.w = math.cos(half_turn / 2.0)
+        marker.scale.x = TORSO_MARKER_DIAMETER_M
+        marker.scale.y = TORSO_MARKER_DIAMETER_M
+        marker.scale.z = TORSO_MARKER_HEIGHT_M
+        red, green, blue, alpha = HUIPredNode._ip_score_to_marker_rgba(ip_score)
+        marker.color.r = red
+        marker.color.g = green
+        marker.color.b = blue
+        marker.color.a = alpha
+        return marker
 
     @staticmethod
     def _build_eye_animation_image(
@@ -1210,20 +1268,31 @@ class HUIPredNode(Node):
             tracks_msg.data = tracks_data
             self._pub_tracks.publish(tracks_msg)
 
-            # Publish valid torso XYZ as PoseArray (identity orientation).
-            torso_poses_msg = PoseArray()
-            torso_poses_msg.header.stamp = self.get_clock().now().to_msg()
-            torso_poses_msg.header.frame_id = self._camera_frame_id
-            for pos in torso_positions_3d:
+            # Publish valid torso positions as colored cylinder markers.
+            stamp = self.get_clock().now().to_msg()
+            torso_markers_msg = MarkerArray()
+            clear_marker = Marker()
+            clear_marker.action = Marker.DELETEALL
+            clear_marker.ns = "huipred_torso"
+            torso_markers_msg.markers.append(clear_marker)
+            for i, tid_raw in enumerate(current_track_ids):
+                pos = torso_positions_3d[i]
                 if pos is None:
                     continue
-                pose = Pose()
-                pose.position.x = float(pos[0])
-                pose.position.y = float(pos[1])
-                pose.position.z = float(pos[2])
-                pose.orientation.w = 1.0
-                torso_poses_msg.poses.append(pose)
-            self._pub_torso_poses.publish(torso_poses_msg)
+                tid = int(tid_raw)
+                ip_score = None
+                if tid in self.track_history:
+                    ip_score = self._latest_ip_score(self.track_history[tid])
+                torso_markers_msg.markers.append(
+                    self._make_torso_cylinder_marker(
+                        stamp,
+                        self._camera_frame_id,
+                        tid,
+                        pos,
+                        ip_score,
+                    )
+                )
+            self._pub_torso_markers.publish(torso_markers_msg)
 
         t_total = time.perf_counter() - t_start
         self.get_logger().info(
