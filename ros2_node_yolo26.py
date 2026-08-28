@@ -91,7 +91,10 @@ COCO_SKELETON = [
     [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
 ]
 
-TORSO_MARKER_DIAMETER_M = 0.5
+PERSON_ARROW_LENGTH_M = 1.8
+PERSON_ARROW_SHAFT_DIAMETER_M = 0.5
+PERSON_ARROW_HEAD_DIAMETER_M = 0.5
+LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
 
 METADATA_CKPT_COLUMNS = [
     "recording", "episode", "image_height", "image_width",
@@ -182,6 +185,118 @@ def project_pixel_to_3d(
     y = (v - cy) * depth_m / fy
     z = depth_m
     return np.array([x, y, z], dtype=np.float32)
+
+
+def _sample_depth_m_at_pixel(
+    pixel_uv: np.ndarray,
+    depth_image: np.ndarray | None,
+    depth_scale: float,
+    fallback_depth_m: float | None,
+) -> float | None:
+    """Return depth in meters at a pixel, or fallback depth when unavailable."""
+    if depth_image is not None:
+        h, w = depth_image.shape[:2]
+        x, y = int(pixel_uv[0]), int(pixel_uv[1])
+        if 0 <= x < w and 0 <= y < h:
+            depth_raw = float(depth_image[y, x])
+            if np.isfinite(depth_raw) and depth_raw > 0:
+                return depth_raw / depth_scale
+    return fallback_depth_m
+
+
+def _quaternion_from_x_to_direction(direction: np.ndarray) -> tuple[float, float, float, float]:
+    """Quaternion (x, y, z, w) rotating marker +X axis to direction."""
+    direction = np.asarray(direction, dtype=np.float32)
+    direction[1] = 0.0
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return 0.0, 0.0, 0.0, 1.0
+    direction /= norm
+    source = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    dot = float(np.clip(np.dot(source, direction), -1.0, 1.0))
+    if dot > 1.0 - 1e-8:
+        return 0.0, 0.0, 0.0, 1.0
+    if dot < -1.0 + 1e-8:
+        return 0.0, 1.0, 0.0, 0.0
+    axis = np.cross(source, direction)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-8:
+        return 0.0, 0.0, 0.0, 1.0
+    axis /= axis_norm
+    angle = float(np.arccos(dot))
+    half = angle / 2.0
+    s = float(np.sin(half))
+    return (
+        float(axis[0] * s),
+        float(axis[1] * s),
+        float(axis[2] * s),
+        float(np.cos(half)),
+    )
+
+
+def compute_person_pose_from_shoulders(
+    keypoints: np.ndarray,
+    scores: np.ndarray,
+    depth_image: np.ndarray | None,
+    camera_matrix: np.ndarray | None,
+    depth_scale: float,
+    kp_thresh: float,
+    torso_center_uv: np.ndarray | None,
+    torso_depth_m: float | None,
+) -> dict | None:
+    """Estimate yaw-only person pose from both shoulders (pitch=roll=0).
+
+    Returns None when either shoulder is missing/unconfident.
+    """
+    if scores[LEFT_SHOULDER] <= kp_thresh or scores[RIGHT_SHOULDER] <= kp_thresh:
+        return None
+
+    left_uv = np.asarray(keypoints[LEFT_SHOULDER], dtype=np.float32)
+    right_uv = np.asarray(keypoints[RIGHT_SHOULDER], dtype=np.float32)
+    shoulder_2d = right_uv - left_uv
+    if float(np.linalg.norm(shoulder_2d)) < 1e-6:
+        return None
+
+    left_depth_m = _sample_depth_m_at_pixel(left_uv, depth_image, depth_scale, torso_depth_m)
+    right_depth_m = _sample_depth_m_at_pixel(right_uv, depth_image, depth_scale, torso_depth_m)
+    left_3d = (
+        project_pixel_to_3d(left_uv, left_depth_m, camera_matrix)
+        if left_depth_m is not None and camera_matrix is not None
+        else None
+    )
+    right_3d = (
+        project_pixel_to_3d(right_uv, right_depth_m, camera_matrix)
+        if right_depth_m is not None and camera_matrix is not None
+        else None
+    )
+
+    if left_3d is not None and right_3d is not None:
+        shoulder_vec = left_3d - right_3d
+        up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+        forward = np.cross(up_cam, shoulder_vec)
+    else:
+        facing_2d = np.array([-shoulder_2d[1], shoulder_2d[0]], dtype=np.float32)
+        forward = np.array([facing_2d[0], 0.0, facing_2d[1]], dtype=np.float32)
+
+    forward[1] = 0.0
+    forward_norm = float(np.linalg.norm(forward))
+    if forward_norm < 1e-6:
+        return None
+    forward /= forward_norm
+
+    position = None
+    if torso_center_uv is not None and torso_depth_m is not None and camera_matrix is not None:
+        position = project_pixel_to_3d(torso_center_uv, torso_depth_m, camera_matrix)
+    elif left_3d is not None and right_3d is not None:
+        position = 0.5 * (left_3d + right_3d)
+
+    quat = _quaternion_from_x_to_direction(forward)
+    bbox_theta = float(np.arctan2(-shoulder_2d[1], shoulder_2d[0]) + (np.pi / 2.0))
+    return {
+        "position": position,
+        "orientation": quat,
+        "bbox_theta": bbox_theta,
+    }
 
 
 def load_model_from_config(config: dict, device: torch.device):
@@ -541,7 +656,7 @@ class HUIPredNode(Node):
             Float32MultiArray, "/huipred/tracks", 10
         )
 
-        # -- Publisher: /huipred/torso_markers (3D torso spheres colored by IP score) --
+        # -- Publisher: /huipred/torso_markers (oriented person arrows colored by IP score) --
         self._pub_torso_markers = self.create_publisher(
             MarkerArray, "/huipred/torso_markers", 10
         )
@@ -833,28 +948,33 @@ class HUIPredNode(Node):
         return 1.0 - value, value, 0.0, 1.0
 
     @staticmethod
-    def _make_torso_sphere_marker(
+    def _make_person_arrow_marker(
         stamp,
         frame_id: str,
         track_id: int,
-        torso_xyz: np.ndarray,
+        position_xyz: np.ndarray,
+        orientation_xyzw: tuple[float, float, float, float],
         ip_score: float | None,
     ) -> Marker:
-        """Build a sphere marker centered on the torso 3D position."""
+        """Build a horizontal arrow marker at the torso showing person yaw."""
         marker = Marker()
         marker.header.stamp = stamp
         marker.header.frame_id = frame_id
         marker.ns = "huipred_torso"
         marker.id = track_id
-        marker.type = Marker.SPHERE
+        marker.type = Marker.ARROW
         marker.action = Marker.ADD
-        marker.pose.position.x = float(torso_xyz[0])
-        marker.pose.position.y = float(torso_xyz[1])
-        marker.pose.position.z = float(torso_xyz[2])
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = TORSO_MARKER_DIAMETER_M
-        marker.scale.y = TORSO_MARKER_DIAMETER_M
-        marker.scale.z = TORSO_MARKER_DIAMETER_M
+        marker.pose.position.x = float(position_xyz[0])
+        marker.pose.position.y = float(position_xyz[1])
+        marker.pose.position.z = float(position_xyz[2])
+        qx, qy, qz, qw = orientation_xyzw
+        marker.pose.orientation.x = qx
+        marker.pose.orientation.y = qy
+        marker.pose.orientation.z = qz
+        marker.pose.orientation.w = qw
+        marker.scale.x = PERSON_ARROW_LENGTH_M
+        marker.scale.y = PERSON_ARROW_SHAFT_DIAMETER_M
+        marker.scale.z = PERSON_ARROW_HEAD_DIAMETER_M
         red, green, blue, alpha = HUIPredNode._ip_score_to_marker_rgba(ip_score)
         marker.color.r = red
         marker.color.g = green
@@ -869,9 +989,9 @@ class HUIPredNode(Node):
         track_id: int,
         bbox_xyxy: np.ndarray,
         box_conf: float,
-        torso_xyz: np.ndarray | None,
+        person_pose: dict,
     ) -> Detection2D:
-        """Build a Detection2D with bbox, track id, and torso pose (identity orientation)."""
+        """Build a Detection2D with bbox, track id, torso pose, and yaw orientation."""
         x1, y1, x2, y2 = [float(v) for v in bbox_xyxy.tolist()]
         detection = Detection2D()
         detection.header.stamp = stamp
@@ -879,7 +999,7 @@ class HUIPredNode(Node):
         detection.id = str(track_id)
         detection.bbox.center.position.x = (x1 + x2) / 2.0
         detection.bbox.center.position.y = (y1 + y2) / 2.0
-        detection.bbox.center.theta = 0.0
+        detection.bbox.center.theta = person_pose["bbox_theta"]
         detection.bbox.size_x = x2 - x1
         detection.bbox.size_y = y2 - y1
 
@@ -889,15 +1009,20 @@ class HUIPredNode(Node):
 
         result = ObjectHypothesisWithPose()
         result.hypothesis = hypothesis
-        if torso_xyz is not None:
-            result.pose.pose.position.x = float(torso_xyz[0])
-            result.pose.pose.position.y = float(torso_xyz[1])
-            result.pose.pose.position.z = float(torso_xyz[2])
+        position = person_pose["position"]
+        if position is not None:
+            result.pose.pose.position.x = float(position[0])
+            result.pose.pose.position.y = float(position[1])
+            result.pose.pose.position.z = float(position[2])
         else:
             result.pose.pose.position.x = -1.0
             result.pose.pose.position.y = -1.0
             result.pose.pose.position.z = -1.0
-        result.pose.pose.orientation.w = 1.0
+        qx, qy, qz, qw = person_pose["orientation"]
+        result.pose.pose.orientation.x = qx
+        result.pose.pose.orientation.y = qy
+        result.pose.pose.orientation.z = qz
+        result.pose.pose.orientation.w = qw
         detection.results.append(result)
         return detection
 
@@ -1070,6 +1195,7 @@ class HUIPredNode(Node):
             depths = []
             torso_pixels = []
             torso_positions_3d = []
+            person_poses = []
         else:
             current_track_ids = results.boxes.id.int().cpu().numpy()
             boxes = results.boxes.xyxy.cpu().numpy()
@@ -1085,6 +1211,7 @@ class HUIPredNode(Node):
             depths = []
             torso_pixels = []
             torso_positions_3d = []
+            person_poses = []
             if depth_image is not None:
                 for i in range(len(current_track_ids)):
                     d_raw, torso_center_uv = estimate_torso_depth_and_center(
@@ -1102,10 +1229,35 @@ class HUIPredNode(Node):
                             self._camera_matrix,
                         )
                     )
+                    person_poses.append(
+                        compute_person_pose_from_shoulders(
+                            keypoints_all[i],
+                            scores_all[i],
+                            depth_image,
+                            self._camera_matrix,
+                            args.depth_scale,
+                            args.kp_thresh,
+                            torso_center_uv,
+                            depth_m,
+                        )
+                    )
             else:
                 depths = [None] * len(current_track_ids)
                 torso_pixels = [None] * len(current_track_ids)
                 torso_positions_3d = [None] * len(current_track_ids)
+                for i in range(len(current_track_ids)):
+                    person_poses.append(
+                        compute_person_pose_from_shoulders(
+                            keypoints_all[i],
+                            scores_all[i],
+                            None,
+                            self._camera_matrix,
+                            args.depth_scale,
+                            args.kp_thresh,
+                            None,
+                            None,
+                        )
+                    )
 
             for i, tid in enumerate(current_track_ids):
                 tid = int(tid)
@@ -1310,7 +1462,7 @@ class HUIPredNode(Node):
             tracks_msg.data = tracks_data
             self._pub_tracks.publish(tracks_msg)
 
-            # Publish valid torso positions as colored sphere markers.
+            # Publish oriented person arrows for valid shoulder-based poses.
             stamp = image_stamp
             torso_markers_msg = MarkerArray()
             clear_marker = Marker()
@@ -1320,19 +1472,20 @@ class HUIPredNode(Node):
             clear_marker.ns = "huipred_torso"
             torso_markers_msg.markers.append(clear_marker)
             for i, tid_raw in enumerate(current_track_ids):
-                pos = torso_positions_3d[i]
-                if pos is None:
+                person_pose = person_poses[i]
+                if person_pose is None or person_pose["position"] is None:
                     continue
                 tid = int(tid_raw)
                 ip_score = None
                 if tid in self.track_history:
                     ip_score = self._latest_ip_score(self.track_history[tid])
                 torso_markers_msg.markers.append(
-                    self._make_torso_sphere_marker(
+                    self._make_person_arrow_marker(
                         stamp,
                         self._camera_frame_id,
                         tid,
-                        pos,
+                        person_pose["position"],
+                        person_pose["orientation"],
                         ip_score,
                     )
                 )
@@ -1342,6 +1495,9 @@ class HUIPredNode(Node):
             detections2d_msg.header.stamp = stamp
             detections2d_msg.header.frame_id = self._camera_frame_id
             for i, tid_raw in enumerate(current_track_ids):
+                person_pose = person_poses[i]
+                if person_pose is None:
+                    continue
                 detections2d_msg.detections.append(
                     self._make_track_detection2d(
                         stamp,
@@ -1349,7 +1505,7 @@ class HUIPredNode(Node):
                         int(tid_raw),
                         boxes[i],
                         float(confs[i]) if len(confs) else -1.0,
-                        torso_positions_3d[i],
+                        person_pose,
                     )
                 )
             self._pub_tracks_detections2d.publish(detections2d_msg)

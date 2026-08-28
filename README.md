@@ -103,19 +103,26 @@ Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
 
 - `/huipred/tracks_detections2d`  
   **Type:** `vision_msgs/msg/Detection2DArray`  
-  **Description:** One `Detection2D` per tracked person for the current frame, published alongside `/huipred/tracks` when estimation mode is not `none_based`. `header.frame_id` is the camera optical frame (`camera_info` when available, otherwise `camera_optical_frame`).
+  **Description:** One `Detection2D` per tracked person with valid left/right shoulder keypoints for the current frame, published alongside `/huipred/tracks` when estimation mode is not `none_based`. `header.stamp` matches the input RGB image timestamp. `header.frame_id` is the camera optical frame (`camera_info` when available, otherwise `camera_optical_frame`).
+
+  **Validity:** A person is omitted when either shoulder keypoint is missing or below the keypoint confidence threshold.
 
   **Per-detection fields:**
 
   | Field | Description |
   |-------|-------------|
   | `id` | YOLO/ByteTrack track identifier (string) |
-  | `bbox.center` | Bounding box center in pixels: `x = (x1+x2)/2`, `y = (y1+y2)/2`, `theta = 0` |
+  | `bbox.center` | Bounding box center in pixels: `x = (x1+x2)/2`, `y = (y1+y2)/2` |
+  | `bbox.center.theta` | Yaw in the image plane derived from the shoulder line (radians) |
   | `bbox.size_x`, `bbox.size_y` | Bounding box width and height in pixels |
   | `results[0].hypothesis.class_id` | `"person"` |
   | `results[0].hypothesis.score` | YOLO box confidence |
-  | `results[0].pose.pose.position` | 3D torso position in the camera frame (meters). `(-1, -1, -1)` if depth projection is unavailable |
-  | `results[0].pose.pose.orientation` | Identity (`w=1`); rotations are not estimated yet |
+  | `results[0].pose.pose.position` | 3D torso position in the camera frame (meters), or shoulder midpoint fallback. `(-1, -1, -1)` if unavailable |
+  | `results[0].pose.pose.orientation` | Yaw-only orientation (pitch=roll=0) from the shoulder line in the camera horizontal plane |
+
+- `/huipred/torso_markers`  
+  **Type:** `visualization_msgs/msg/MarkerArray`  
+  **Description:** Oriented `ARROW` markers at each valid person pose (same shoulder validity rules as `/huipred/tracks_detections2d`). Arrow length is 1.8 m, shaft/head diameter is 0.5 m, color encodes IP score (gray when unavailable, red→green for 0→1). Timestamps match the input RGB image.
 
 - `/huipred/torso_poses`  
   **Type:** `geometry_msgs/msg/PoseArray`  
