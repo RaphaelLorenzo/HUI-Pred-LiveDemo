@@ -4,7 +4,8 @@ ROS2 node for 3D human pose via YOLO26 tracking + MotionBERT lifting.
 
 Subscribes to RGB, depth, and camera_info, publishes sphere markers for each
 H36M joint in the camera optical frame on /huipred/pose3d_markers, and a debug
-2D overlay on /huipred/pose3d_debug/image_raw.
+2D overlay on /huipred/pose3d_debug/image_raw, and the same 3D markers transformed
+to base_link on /huipred/pose3d_markers_base_link (via /tf).
 
 Run (Docker / ROS Humble, Python 3.10):
     python3.10 ros2_node_3d_pose.py
@@ -18,8 +19,11 @@ from functools import partial
 import cv2
 import numpy as np
 import rclpy
+from rclpy.duration import Duration
 import torch
 import torch.nn as nn
+import tf2_ros
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
 from visualization_msgs.msg import Marker, MarkerArray
@@ -209,6 +213,20 @@ def place_skeleton_in_camera(joints_3d: np.ndarray, torso_3d_target: np.ndarray)
     return joints_3d + offset
 
 
+def transform_points(transform, points: np.ndarray) -> np.ndarray:
+    """Apply a geometry_msgs/Transform to Nx3 points."""
+    t = transform.transform.translation
+    q = transform.transform.rotation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    rot = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+    offset = np.array([t.x, t.y, t.z], dtype=np.float64)
+    return (rot @ points.astype(np.float64).T).T + offset
+
+
 class Pose3DNode(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__("pose_3d_node")
@@ -222,6 +240,12 @@ class Pose3DNode(Node):
         self._cv_bridge = CvBridge() if CvBridge is not None else None
         self.track_poses: dict[int, list] = {}  # track_id -> list of (17,3) COCO keypoints
         self._active_marker_ids: set[int] = set()
+        self._active_marker_ids_base: set[int] = set()
+        self._base_link_frame = args.base_link_frame
+        self._tf_timeout = args.tf_timeout
+
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         depth_topic = args.depth_topic
         self.compressed_depth = (
@@ -259,6 +283,9 @@ class Pose3DNode(Node):
         self.mb_flip = bool(mb_config.get("flip", True))
 
         self._pub_markers = self.create_publisher(MarkerArray, args.marker_topic, 10)
+        self._pub_markers_base = self.create_publisher(
+            MarkerArray, args.base_link_marker_topic, 10
+        )
         self._debug_enabled = args.debug_image_topic.lower() != "none"
         self._pub_debug = None
         if self._debug_enabled:
@@ -278,8 +305,74 @@ class Pose3DNode(Node):
         sync.registerCallback(self._synced_cb)
         self.get_logger().info(
             f"Ready | RGB={args.rgb_topic} depth={depth_topic} "
-            f"markers={args.marker_topic} debug={'off' if not self._debug_enabled else args.debug_image_topic}"
+            f"markers={args.marker_topic} base={args.base_link_marker_topic} "
+            f"debug={'off' if not self._debug_enabled else args.debug_image_topic}"
         )
+
+    def _lookup_camera_to_base(self, stamp):
+        try:
+            return self._tf_buffer.lookup_transform(
+                self._base_link_frame,
+                self._camera_frame_id,
+                stamp,
+                timeout=Duration(seconds=self._tf_timeout),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+
+    def _publish_marker_array(
+        self,
+        pub,
+        stamp,
+        frame_id: str,
+        ns: str,
+        joint_entries: list,
+        track_colors: dict,
+        active_ids: set,
+    ):
+        """joint_entries: list of (marker_id, xyz, tid, alpha)."""
+        marker_array = MarkerArray()
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        clear.ns = ns
+        clear.header.stamp = stamp
+        clear.header.frame_id = frame_id
+        marker_array.markers.append(clear)
+
+        new_ids: set[int] = set()
+        for marker_id, xyz, tid, alpha in joint_entries:
+            new_ids.add(marker_id)
+            b, g, r = track_colors[tid]
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = frame_id
+            m.ns = ns
+            m.id = marker_id
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = float(xyz[0])
+            m.pose.position.y = float(xyz[1])
+            m.pose.position.z = float(xyz[2])
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = MARKER_DIAMETER_M
+            m.color.r = r / 255.0
+            m.color.g = g / 255.0
+            m.color.b = b / 255.0
+            m.color.a = alpha
+            marker_array.markers.append(m)
+
+        for mid in active_ids - new_ids:
+            del_m = Marker()
+            del_m.header.stamp = stamp
+            del_m.header.frame_id = frame_id
+            del_m.ns = ns
+            del_m.id = mid
+            del_m.action = Marker.DELETE
+            marker_array.markers.append(del_m)
+
+        pub.publish(marker_array)
+        active_ids.clear()
+        active_ids.update(new_ids)
 
     def _camera_info_cb(self, msg: CameraInfo):
         self._camera_matrix = np.array(msg.k, dtype=np.float32).reshape(3, 3)
@@ -385,25 +478,16 @@ class Pose3DNode(Node):
         results = self.pose_model.track(bgr, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
 
         debug = bgr.copy() if self._debug_enabled else None
-        marker_array = MarkerArray()
-        clear = Marker()
-        clear.action = Marker.DELETEALL
-        clear.ns = "pose3d"
-        clear.header.stamp = stamp
-        clear.header.frame_id = self._camera_frame_id
-        marker_array.markers.append(clear)
 
         if results.boxes.id is None:
-            for mid in self._active_marker_ids:
-                del_m = Marker()
-                del_m.header.stamp = stamp
-                del_m.header.frame_id = self._camera_frame_id
-                del_m.ns = "pose3d"
-                del_m.id = mid
-                del_m.action = Marker.DELETE
-                marker_array.markers.append(del_m)
-            self._active_marker_ids.clear()
-            self._pub_markers.publish(marker_array)
+            self._publish_marker_array(
+                self._pub_markers, stamp, self._camera_frame_id, "pose3d",
+                [], {}, self._active_marker_ids,
+            )
+            self._publish_marker_array(
+                self._pub_markers_base, stamp, self._base_link_frame, "pose3d_base",
+                [], {}, self._active_marker_ids_base,
+            )
             if debug is not None:
                 self._publish_debug_image(stamp, self._camera_frame_id, debug)
             return
@@ -473,7 +557,7 @@ class Pose3DNode(Node):
             torso_targets.append(torso_3d)
             infer_scores.append(kp_sc)
 
-        new_marker_ids: set[int] = set()
+        joint_entries = []
         if infer_inputs:
             batch = np.stack(infer_inputs, axis=0)
             joints_batch = self._motionbert_infer(batch)
@@ -483,43 +567,40 @@ class Pose3DNode(Node):
             ):
                 joints_3d = scale_skeleton_to_meters(joints_3d)
                 joints_3d = place_skeleton_in_camera(joints_3d, torso_3d)
-                b, g, r = track_colors[tid]
                 h36m_conf = h36m_confidences_from_coco(kp_sc)
                 for j_idx, xyz in enumerate(joints_3d):
                     alpha = confidence_to_alpha(float(h36m_conf[j_idx]))
                     if alpha <= 0.0:
                         continue
-                    marker_id = tid * 100 + j_idx
-                    new_marker_ids.add(marker_id)
-                    m = Marker()
-                    m.header.stamp = stamp
-                    m.header.frame_id = self._camera_frame_id
-                    m.ns = "pose3d"
-                    m.id = marker_id
-                    m.type = Marker.SPHERE
-                    m.action = Marker.ADD
-                    m.pose.position.x = float(xyz[0])
-                    m.pose.position.y = float(xyz[1])
-                    m.pose.position.z = float(xyz[2])
-                    m.pose.orientation.w = 1.0
-                    m.scale.x = m.scale.y = m.scale.z = MARKER_DIAMETER_M
-                    m.color.r = r / 255.0
-                    m.color.g = g / 255.0
-                    m.color.b = b / 255.0
-                    m.color.a = alpha
-                    marker_array.markers.append(m)
+                    joint_entries.append((tid * 100 + j_idx, xyz, tid, alpha))
 
-        for mid in self._active_marker_ids - new_marker_ids:
-            del_m = Marker()
-            del_m.header.stamp = stamp
-            del_m.header.frame_id = self._camera_frame_id
-            del_m.ns = "pose3d"
-            del_m.id = mid
-            del_m.action = Marker.DELETE
-            marker_array.markers.append(del_m)
-        self._active_marker_ids = new_marker_ids
+        self._publish_marker_array(
+            self._pub_markers, stamp, self._camera_frame_id, "pose3d",
+            joint_entries, track_colors, self._active_marker_ids,
+        )
 
-        self._pub_markers.publish(marker_array)
+        base_entries = joint_entries
+        camera_to_base = self._lookup_camera_to_base(stamp)
+        if camera_to_base is not None and joint_entries:
+            xyz_cam = np.stack([xyz for _, xyz, _, _ in joint_entries], axis=0)
+            xyz_base = transform_points(camera_to_base, xyz_cam)
+            base_entries = [
+                (marker_id, xyz_base[i], tid, alpha)
+                for i, (marker_id, _, tid, alpha) in enumerate(joint_entries)
+            ]
+        elif camera_to_base is None and joint_entries:
+            self.get_logger().warning(
+                f"No TF {self._camera_frame_id} -> {self._base_link_frame}; "
+                "skipping base_link markers",
+                throttle_duration_sec=5.0,
+            )
+
+        self._publish_marker_array(
+            self._pub_markers_base, stamp, self._base_link_frame, "pose3d_base",
+            base_entries if camera_to_base is not None else [],
+            track_colors, self._active_marker_ids_base,
+        )
+
         if debug is not None:
             self._publish_debug_image(stamp, self._camera_frame_id, debug)
         dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -568,6 +649,17 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--marker_topic", type=str, default="/huipred/pose3d_markers",
+    )
+    parser.add_argument(
+        "--base_link_marker_topic", type=str,
+        default="/huipred/pose3d_markers_base_link",
+    )
+    parser.add_argument(
+        "--base_link_frame", type=str, default="base_link",
+    )
+    parser.add_argument(
+        "--tf_timeout", type=float, default=0.1,
+        help="Seconds to wait for camera->base_link TF lookup",
     )
     parser.add_argument(
         "--debug_image_topic", type=str, default="/huipred/pose3d_debug/image_raw",
