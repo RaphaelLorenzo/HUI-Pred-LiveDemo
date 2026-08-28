@@ -85,6 +85,8 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/tegra:$LD_L
 COPY download_yolo_weights.py /tmp/download_yolo_weights.py
 RUN python /tmp/download_yolo_weights.py --output_path /root/.config/Ultralytics/weights/checkpoints/yolo26x-pose.pt
 
+RUN apt-get update && apt-get install -y ros-humble-vision-msgs && rm -rf /var/lib/apt/lists/*
+
 # Ensure the environment is active for any command run via 'docker run'
 # ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "ai_env", "/bin/bash", "-l", "-c"]
 CMD ["/bin/bash"]

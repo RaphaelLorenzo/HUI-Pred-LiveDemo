@@ -23,6 +23,12 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
 from std_msgs.msg import Float32MultiArray, String
+from vision_msgs.msg import (
+    Detection2D,
+    Detection2DArray,
+    ObjectHypothesis,
+    ObjectHypothesisWithPose,
+)
 from visualization_msgs.msg import Marker, MarkerArray
 import message_filters
 
@@ -539,6 +545,11 @@ class HUIPredNode(Node):
         self._pub_torso_markers = self.create_publisher(
             MarkerArray, "/huipred/torso_markers", 10
         )
+
+        # -- Publisher: /huipred/tracks_detections2d (2D bboxes + 3D torso poses) --
+        self._pub_tracks_detections2d = self.create_publisher(
+            Detection2DArray, "/huipred/tracks_detections2d", 10
+        )
         self._overlay_mode = args.overlay_mode
         self.get_logger().info(f"Overlay mode: {self._overlay_mode}")
 
@@ -850,6 +861,45 @@ class HUIPredNode(Node):
         marker.color.b = blue
         marker.color.a = alpha
         return marker
+
+    @staticmethod
+    def _make_track_detection2d(
+        stamp,
+        frame_id: str,
+        track_id: int,
+        bbox_xyxy: np.ndarray,
+        box_conf: float,
+        torso_xyz: np.ndarray | None,
+    ) -> Detection2D:
+        """Build a Detection2D with bbox, track id, and torso pose (identity orientation)."""
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy.tolist()]
+        detection = Detection2D()
+        detection.header.stamp = stamp
+        detection.header.frame_id = frame_id
+        detection.id = str(track_id)
+        detection.bbox.center.position.x = (x1 + x2) / 2.0
+        detection.bbox.center.position.y = (y1 + y2) / 2.0
+        detection.bbox.center.theta = 0.0
+        detection.bbox.size_x = x2 - x1
+        detection.bbox.size_y = y2 - y1
+
+        hypothesis = ObjectHypothesis()
+        hypothesis.class_id = "person"
+        hypothesis.score = float(box_conf)
+
+        result = ObjectHypothesisWithPose()
+        result.hypothesis = hypothesis
+        if torso_xyz is not None:
+            result.pose.pose.position.x = float(torso_xyz[0])
+            result.pose.pose.position.y = float(torso_xyz[1])
+            result.pose.pose.position.z = float(torso_xyz[2])
+        else:
+            result.pose.pose.position.x = -1.0
+            result.pose.pose.position.y = -1.0
+            result.pose.pose.position.z = -1.0
+        result.pose.pose.orientation.w = 1.0
+        detection.results.append(result)
+        return detection
 
     @staticmethod
     def _build_eye_animation_image(
@@ -1285,6 +1335,22 @@ class HUIPredNode(Node):
                     )
                 )
             self._pub_torso_markers.publish(torso_markers_msg)
+
+            detections2d_msg = Detection2DArray()
+            detections2d_msg.header.stamp = stamp
+            detections2d_msg.header.frame_id = self._camera_frame_id
+            for i, tid_raw in enumerate(current_track_ids):
+                detections2d_msg.detections.append(
+                    self._make_track_detection2d(
+                        stamp,
+                        self._camera_frame_id,
+                        int(tid_raw),
+                        boxes[i],
+                        float(confs[i]) if len(confs) else -1.0,
+                        torso_positions_3d[i],
+                    )
+                )
+            self._pub_tracks_detections2d.publish(detections2d_msg)
 
         t_total = time.perf_counter() - t_start
         self.get_logger().info(

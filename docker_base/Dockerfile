@@ -78,3 +78,5 @@ RUN ln -sf /bin/bash /bin/sh
 # Pre-download YOLO pose weights so they are cached in the image
 COPY download_yolo_weights.py /tmp/download_yolo_weights.py
 RUN python /tmp/download_yolo_weights.py --output_path /root/.config/Ultralytics/weights/checkpoints/yolo26x-pose.pt
+
+RUN apt-get update && apt-get install -y ros-${ROS_DISTRO}-vision-msgs && rm -rf /var/lib/apt/lists/*

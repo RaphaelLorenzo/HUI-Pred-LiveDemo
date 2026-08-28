@@ -101,6 +101,22 @@ Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
 
   **Example:** To read person 2's bounding box and depth from `data`: `base = 2 * 70`, then `x1 = data[base + 3]`, `depth = data[base + 8]`.
 
+- `/huipred/tracks_detections2d`  
+  **Type:** `vision_msgs/msg/Detection2DArray`  
+  **Description:** One `Detection2D` per tracked person for the current frame, published alongside `/huipred/tracks` when estimation mode is not `none_based`. `header.frame_id` is the camera optical frame (`camera_info` when available, otherwise `camera_optical_frame`).
+
+  **Per-detection fields:**
+
+  | Field | Description |
+  |-------|-------------|
+  | `id` | YOLO/ByteTrack track identifier (string) |
+  | `bbox.center` | Bounding box center in pixels: `x = (x1+x2)/2`, `y = (y1+y2)/2`, `theta = 0` |
+  | `bbox.size_x`, `bbox.size_y` | Bounding box width and height in pixels |
+  | `results[0].hypothesis.class_id` | `"person"` |
+  | `results[0].hypothesis.score` | YOLO box confidence |
+  | `results[0].pose.pose.position` | 3D torso position in the camera frame (meters). `(-1, -1, -1)` if depth projection is unavailable |
+  | `results[0].pose.pose.orientation` | Identity (`w=1`); rotations are not estimated yet |
+
 - `/huipred/torso_poses`  
   **Type:** `geometry_msgs/msg/PoseArray`  
   **Description:** 3D torso positions for the current frame, in the camera optical frame (`header.frame_id` comes from `camera_info` when available, otherwise `camera_optical_frame`). Only **valid** projections are included (one `Pose` per person with a successful depth + camera_info projection). Orientation is identity (`w=1`); only `position.x/y/z` is meaningful.
