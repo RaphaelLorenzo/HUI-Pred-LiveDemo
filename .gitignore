@@ -9,3 +9,4 @@ output/videos/
 debug/
 frame_000146.jpg
 runs*
+checkpoints/mb_pose_estimation_ft.bin
