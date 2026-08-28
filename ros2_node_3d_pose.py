@@ -4,7 +4,7 @@ ROS2 node for 3D human pose via YOLO26 tracking + MotionBERT lifting.
 
 Subscribes to RGB, depth, and camera_info, publishes sphere markers for each
 H36M joint in the camera optical frame on /huipred/pose3d_markers, and a debug
-2D overlay on /huipred/pose3d_debug/compressed.
+2D overlay on /huipred/pose3d_debug/image_raw.
 
 Run (Docker / ROS Humble, Python 3.10):
     python3.10 ros2_node_3d_pose.py
@@ -194,7 +194,7 @@ class Pose3DNode(Node):
         self.mb_flip = bool(mb_config.get("flip", True))
 
         self._pub_markers = self.create_publisher(MarkerArray, args.marker_topic, 10)
-        self._pub_debug = self.create_publisher(CompressedImage, args.debug_image_topic, 10)
+        self._pub_debug = self.create_publisher(RosImage, args.debug_image_topic, 10)
 
         self.create_subscription(
             CameraInfo, args.camera_info_topic, self._camera_info_cb, 10
@@ -296,17 +296,19 @@ class Pose3DNode(Node):
                 pred[:, :, 0, :] = 0.0
         return pred[:, -1].cpu().numpy()
 
-    @staticmethod
-    def _publish_debug_image(pub, stamp, frame_id: str, bgr: np.ndarray):
-        ok, encoded = cv2.imencode(".jpg", bgr)
-        if not ok:
-            return
-        msg = CompressedImage()
+    def _publish_debug_image(self, stamp, frame_id: str, bgr: np.ndarray):
+        if self._cv_bridge is not None:
+            msg = self._cv_bridge.cv2_to_imgmsg(bgr, encoding="bgr8")
+        else:
+            msg = RosImage()
+            msg.height, msg.width = bgr.shape[:2]
+            msg.encoding = "bgr8"
+            msg.is_bigendian = False
+            msg.step = bgr.shape[1] * 3
+            msg.data = bgr.tobytes()
         msg.header.stamp = stamp
         msg.header.frame_id = frame_id
-        msg.format = "jpeg"
-        msg.data = encoded.tobytes()
-        pub.publish(msg)
+        self._pub_debug.publish(msg)
 
     def _process_frame(self, bgr: np.ndarray, depth_raw: np.ndarray, stamp):
         t0 = time.perf_counter()
@@ -322,7 +324,7 @@ class Pose3DNode(Node):
 
         if results.boxes.id is None:
             self._pub_markers.publish(marker_array)
-            self._publish_debug_image(self._pub_debug, stamp, self._camera_frame_id, debug)
+            self._publish_debug_image(stamp, self._camera_frame_id, debug)
             return
 
         track_ids = results.boxes.id.int().cpu().numpy()
@@ -405,7 +407,7 @@ class Pose3DNode(Node):
                     marker_array.markers.append(m)
 
         self._pub_markers.publish(marker_array)
-        self._publish_debug_image(self._pub_debug, stamp, self._camera_frame_id, debug)
+        self._publish_debug_image(stamp, self._camera_frame_id, debug)
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.get_logger().info(
             f"{len(track_ids)} tracks | {len(infer_inputs)} posed | {dt_ms:.1f} ms"
@@ -454,7 +456,7 @@ if __name__ == "__main__":
         "--marker_topic", type=str, default="/huipred/pose3d_markers",
     )
     parser.add_argument(
-        "--debug_image_topic", type=str, default="/huipred/pose3d_debug/compressed",
+        "--debug_image_topic", type=str, default="/huipred/pose3d_debug/image_raw",
     )
     parser.add_argument("--kp_thresh", type=float, default=0.3)
     parser.add_argument("--depth_scale", type=float, default=1000.0)
