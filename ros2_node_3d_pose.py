@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.duration import Duration
+from rclpy.time import Time
 import torch
 import torch.nn as nn
 import tf2_ros
@@ -368,27 +369,26 @@ class Pose3DNode(Node):
         )
 
     def _lookup_camera_to_base(self, stamp):
-        # try:
-        #     return self._tf_buffer.lookup_transform(
-        #         self._base_link_frame,
-        #         self._camera_frame_id,
-        #         stamp,
-        #         timeout=Duration(seconds=self._tf_timeout),
-        #     )
-        # except (LookupException, ConnectivityException, ExtrapolationException):
-        #     self.get_logger().warning(f"No TF {self._camera_frame_id} -> {self._base_link_frame} found.")
-        #     return None
-        tf_lookup = self._tf_buffer.lookup_transform(
-            self._base_link_frame,
-            self._camera_frame_id,
-            stamp,
-            timeout=Duration(seconds=self._tf_timeout),
-        )
-        if tf_lookup is None:
-            self.get_logger().warning(f"No TF {self._camera_frame_id} -> {self._base_link_frame} found.")
+        try:
+            return self._tf_buffer.lookup_transform(
+                self._base_link_frame,
+                self._camera_frame_id,
+                stamp,
+                timeout=Duration(seconds=self._tf_timeout),
+            )
+        except ExtrapolationException:
+            # Camera stamp can be slightly ahead of the latest /tf sample.
+            try:
+                return self._tf_buffer.lookup_transform(
+                    self._base_link_frame,
+                    self._camera_frame_id,
+                    Time(),
+                    timeout=Duration(seconds=self._tf_timeout),
+                )
+            except (LookupException, ConnectivityException, ExtrapolationException):
+                return None
+        except (LookupException, ConnectivityException):
             return None
-        
-        return tf_lookup
 
     def _publish_skeleton_markers(
         self,
