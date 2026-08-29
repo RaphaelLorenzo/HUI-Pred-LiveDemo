@@ -128,6 +128,42 @@ Validation/test sequences are in `EntranceCFacing`, `Room104` and `AlbeeSquare`
   **Type:** `geometry_msgs/msg/PoseArray`  
   **Description:** 3D torso positions for the current frame, in the camera optical frame (`header.frame_id` comes from `camera_info` when available, otherwise `camera_optical_frame`). Only **valid** projections are included (one `Pose` per person with a successful depth + camera_info projection). Orientation is identity (`w=1`); only `position.x/y/z` is meaningful.
 
+### `ros2_node_3d_pose.py` (3D pose lifting)
+
+Run with:
+
+```bash
+python3.10 ros2_node_3d_pose.py
+```
+
+Requires synced RGB + depth + `camera_info`, and `/tf` (camera optical frame → `base_link`). Tracks are kept only when at least 5 COCO keypoints and both shoulders are above `--kp_thresh` (default 0.3).
+
+**Outputs in `base_link`** (published when TF lookup succeeds):
+
+- `/huipred/pose3d_markers_base_link`  
+  **Type:** `visualization_msgs/msg/MarkerArray`  
+  **Description:** Full H36M skeleton visualization per valid person. `header.frame_id` is `base_link` (override with `--base_link_frame`). Each person gets 17 joint spheres (10 cm) and 16 bone segments. Bone/joint colors follow the standard scheme: green = left, red = right, blue = center/torso/head. Alpha scales with 2D keypoint confidence (hidden below 0.5).
+
+- `/huipred/pose3d_poses_base_link`  
+  **Type:** `geometry_msgs/msg/PoseArray`  
+  **Description:** One entry per valid 3D pose. `header.frame_id` is `base_link`. Each `Pose` places the **H36M thorax** (joint 8) at `position` and sets **yaw-only** orientation (pitch=roll=0, z up) from the shoulder line in the horizontal plane. Order matches successfully lifted tracks (no explicit track id in the message).
+
+- `/huipred/pose3d_detections2d_base_link`  
+  **Type:** `vision_msgs/msg/Detection2DArray`  
+  **Description:** One `Detection2D` per valid 3D pose, with a single hypothesis. `header.frame_id` is `base_link`. The 2D `bbox` fields are still in **image pixels** (YOLO box + image-plane shoulder yaw); the 3D fields are in `base_link`:
+
+  | Field | Description |
+  |-------|-------------|
+  | `id` | YOLO/ByteTrack track identifier (string) |
+  | `bbox.center`, `bbox.size_x/y` | 2D bounding box in pixels |
+  | `bbox.center.theta` | Yaw in the image plane from COCO shoulders (radians) |
+  | `results[0].hypothesis.class_id` | `"person"` |
+  | `results[0].hypothesis.score` | YOLO box confidence |
+  | `results[0].pose.pose.position` | H36M thorax (joint 8) in `base_link` (meters) |
+  | `results[0].pose.pose.orientation` | Yaw-only quaternion in `base_link` (same convention as `/huipred/pose3d_poses_base_link`) |
+
+Also publishes `/huipred/pose3d_markers` (same skeleton in the camera optical frame) and optionally `/huipred/pose3d_debug/image_raw` (set `--debug_image_topic none` to disable).
+
 
 ## Remarks
 For compatibily reasons the checkpoints containing config and `state_dict` must be separated using `convert_checkpoints.py` before running using the jetson docker.
