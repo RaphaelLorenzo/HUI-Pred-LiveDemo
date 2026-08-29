@@ -17,14 +17,14 @@ cd docker_base
 docker build -t huipreddemo_base:latest .
 cd ../
 sh docker_base/run_container.sh
-python ros2_node_yolo26.py -bp -ip ./checkpoints/converted_mb_FineTuned_SingleImage_05_03_26_best_adaptative_f1/ --overlay_mode nodrawing
+python ros2_node_yolo26.py -ip ./checkpoints/converted_mb_FineTuned_SingleImageV2_05_03_26_best_adaptative_f1 -bp --overlay_mode nodrawing
 ```
 
 - On jetson using `docker` (with a ROS2 node subscribing to )
 ```
 docker build -t huipreddemo_jetson:latest .
 sh run_docker.sh
-python ros2_node_yolo26.py -bp -ip ./checkpoints/converted_mb_FineTuned_SingleImage_05_03_26_best_adaptative_f1/ --overlay_mode nodrawing
+python ros2_node_yolo26.py -ip ./checkpoints/converted_mb_FineTuned_SingleImageV2_05_03_26_best_adaptative_f1 -bp --overlay_mode nodrawing
 ```
 
 ## List of sequences per location for testing
