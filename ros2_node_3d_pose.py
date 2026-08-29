@@ -45,12 +45,12 @@ from utils.other_utils import read_yaml_to_dic
 from utils.visualization import get_track_color
 
 # H36M joint indices used for scaling / placement
-H36M_LEFT_ANKLE, H36M_RIGHT_ANKLE = 6, 3
+H36M_LEFT_HIP, H36M_RIGHT_HIP = 4, 1
 H36M_LEFT_SHOULDER, H36M_RIGHT_SHOULDER = 11, 14
 H36M_TORSO = 8  # thorax (mid-shoulders)
 COCO_LEFT_SHOULDER, COCO_RIGHT_SHOULDER = 5, 6
 MIN_VALID_KEYPOINTS = 5
-TARGET_LIMB_LENGTH_M = 1.5
+TARGET_LIMB_LENGTH_M = 0.50
 MARKER_DIAMETER_M = 0.10
 BONE_LINE_WIDTH_M = 0.03
 SEQ_LEN = 15
@@ -230,10 +230,10 @@ def build_padded_sequence(pose_history: list, seq_len: int) -> np.ndarray:
 
 
 def scale_skeleton_to_meters(joints_3d: np.ndarray) -> np.ndarray:
-    """Scale root-relative H36M skeleton so ankle-shoulder limbs are ~1.5 m."""
+    """Scale root-relative H36M skeleton so shoulder-hip limbs are ~0.50 m."""
     factors = []
-    left_len = np.linalg.norm(joints_3d[H36M_LEFT_ANKLE] - joints_3d[H36M_LEFT_SHOULDER])
-    right_len = np.linalg.norm(joints_3d[H36M_RIGHT_ANKLE] - joints_3d[H36M_RIGHT_SHOULDER])
+    left_len = np.linalg.norm(joints_3d[H36M_LEFT_HIP] - joints_3d[H36M_LEFT_SHOULDER])
+    right_len = np.linalg.norm(joints_3d[H36M_RIGHT_HIP] - joints_3d[H36M_RIGHT_SHOULDER])
     if left_len > 1e-6:
         factors.append(TARGET_LIMB_LENGTH_M / left_len)
     if right_len > 1e-6:
