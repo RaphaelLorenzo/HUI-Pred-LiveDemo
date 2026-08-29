@@ -5,7 +5,8 @@ ROS2 node for 3D human pose via YOLO26 tracking + MotionBERT lifting.
 Subscribes to RGB, depth, and camera_info, publishes sphere markers for each
 H36M joint in the camera optical frame on /huipred/pose3d_markers, and a debug
 2D overlay on /huipred/pose3d_debug/image_raw, and the same 3D markers transformed
-to base_link on /huipred/pose3d_markers_base_link (via /tf).
+to base_link on /huipred/pose3d_markers_base_link (via /tf), and yaw-only torso
+PoseArray on /huipred/pose3d_poses_base_link.
 
 Run (Docker / ROS Humble, Python 3.10):
     python3.10 ros2_node_3d_pose.py
@@ -26,6 +27,7 @@ import tf2_ros
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
+from geometry_msgs.msg import Point, Pose, PoseArray
 from visualization_msgs.msg import Marker, MarkerArray
 import message_filters
 
@@ -45,10 +47,36 @@ from utils.visualization import get_track_color
 H36M_LEFT_ANKLE, H36M_RIGHT_ANKLE = 6, 3
 H36M_LEFT_SHOULDER, H36M_RIGHT_SHOULDER = 11, 14
 H36M_TORSO = 8  # thorax (mid-shoulders)
+COCO_LEFT_SHOULDER, COCO_RIGHT_SHOULDER = 5, 6
+MIN_VALID_KEYPOINTS = 5
 TARGET_LIMB_LENGTH_M = 1.5
 MARKER_DIAMETER_M = 0.10
+BONE_LINE_WIDTH_M = 0.03
 SEQ_LEN = 15
 CONF_ALPHA_MIN = 0.5
+
+# H36M skeleton (MotionBERT vismo convention): L=green, M=blue, R=red
+H36M_LIMB_SEQ = [
+    [0, 1], [1, 2], [2, 3], [0, 4], [4, 5], [5, 6], [0, 7], [7, 8],
+    [8, 9], [8, 11], [8, 14], [9, 10], [11, 12], [12, 13], [14, 15], [15, 16],
+]
+COLOR_LEFT = (0.0, 1.0, 0.0)
+COLOR_MID = (0.0, 0.0, 1.0)
+COLOR_RIGHT = (1.0, 0.0, 0.0)
+H36M_JOINT_COLORS = [
+    COLOR_MID, COLOR_RIGHT, COLOR_RIGHT, COLOR_RIGHT,
+    COLOR_LEFT, COLOR_LEFT, COLOR_LEFT,
+    COLOR_MID, COLOR_MID, COLOR_MID, COLOR_MID,
+    COLOR_LEFT, COLOR_LEFT, COLOR_LEFT,
+    COLOR_RIGHT, COLOR_RIGHT, COLOR_RIGHT,
+]
+H36M_LIMB_COLORS = [
+    COLOR_RIGHT, COLOR_RIGHT, COLOR_RIGHT,
+    COLOR_LEFT, COLOR_LEFT, COLOR_LEFT,
+    COLOR_MID, COLOR_MID, COLOR_MID,
+    COLOR_LEFT, COLOR_RIGHT, COLOR_MID,
+    COLOR_LEFT, COLOR_LEFT, COLOR_RIGHT, COLOR_RIGHT,
+]
 
 COCO_SKELETON = [
     [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],
@@ -62,6 +90,13 @@ def confidence_to_alpha(conf: float) -> float:
     if conf < CONF_ALPHA_MIN:
         return 0.0
     return min(1.0, (conf - CONF_ALPHA_MIN) / (1.0 - CONF_ALPHA_MIN))
+
+
+def is_valid_coco_detection(scores: np.ndarray, kp_thresh: float) -> bool:
+    """Require both shoulders and at least MIN_VALID_KEYPOINTS confident joints."""
+    if scores[COCO_LEFT_SHOULDER] <= kp_thresh or scores[COCO_RIGHT_SHOULDER] <= kp_thresh:
+        return False
+    return int((scores > kp_thresh).sum()) >= MIN_VALID_KEYPOINTS
 
 
 def dim_bgr_color(color: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
@@ -227,6 +262,27 @@ def transform_points(transform, points: np.ndarray) -> np.ndarray:
     return (rot @ points.astype(np.float64).T).T + offset
 
 
+def yaw_from_shoulders_base(joints_base: np.ndarray) -> float | None:
+    """Yaw in base_link (z up) from H36M left/right shoulder positions."""
+    width = joints_base[H36M_RIGHT_SHOULDER] - joints_base[H36M_LEFT_SHOULDER]
+    width_xy = width.copy()
+    width_xy[2] = 0.0
+    norm = float(np.linalg.norm(width_xy))
+    if norm < 1e-6:
+        return None
+    width_xy /= norm
+    forward = np.cross(np.array([0.0, 0.0, 1.0]), width_xy)
+    return float(np.arctan2(forward[1], forward[0]))
+
+
+def joint_marker_id(tid: int, joint_idx: int) -> int:
+    return tid * 100 + joint_idx
+
+
+def bone_marker_id(tid: int, bone_idx: int) -> int:
+    return tid * 100 + 20 + bone_idx
+
+
 class Pose3DNode(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__("pose_3d_node")
@@ -286,6 +342,7 @@ class Pose3DNode(Node):
         self._pub_markers_base = self.create_publisher(
             MarkerArray, args.base_link_marker_topic, 10
         )
+        self._pub_poses_base = self.create_publisher(PoseArray, args.pose_array_topic, 10)
         self._debug_enabled = args.debug_image_topic.lower() != "none"
         self._pub_debug = None
         if self._debug_enabled:
@@ -306,6 +363,7 @@ class Pose3DNode(Node):
         self.get_logger().info(
             f"Ready | RGB={args.rgb_topic} depth={depth_topic} "
             f"markers={args.marker_topic} base={args.base_link_marker_topic} "
+            f"poses={args.pose_array_topic} "
             f"debug={'off' if not self._debug_enabled else args.debug_image_topic}"
         )
 
@@ -320,17 +378,16 @@ class Pose3DNode(Node):
         except (LookupException, ConnectivityException, ExtrapolationException):
             return None
 
-    def _publish_marker_array(
+    def _publish_skeleton_markers(
         self,
         pub,
         stamp,
         frame_id: str,
         ns: str,
-        joint_entries: list,
-        track_colors: dict,
+        skeletons: list,
         active_ids: set,
     ):
-        """joint_entries: list of (marker_id, xyz, tid, alpha)."""
+        """skeletons: list of (tid, joints_3d (17,3), h36m_conf (17,))."""
         marker_array = MarkerArray()
         clear = Marker()
         clear.action = Marker.DELETEALL
@@ -340,26 +397,51 @@ class Pose3DNode(Node):
         marker_array.markers.append(clear)
 
         new_ids: set[int] = set()
-        for marker_id, xyz, tid, alpha in joint_entries:
-            new_ids.add(marker_id)
-            b, g, r = track_colors[tid]
-            m = Marker()
-            m.header.stamp = stamp
-            m.header.frame_id = frame_id
-            m.ns = ns
-            m.id = marker_id
-            m.type = Marker.SPHERE
-            m.action = Marker.ADD
-            m.pose.position.x = float(xyz[0])
-            m.pose.position.y = float(xyz[1])
-            m.pose.position.z = float(xyz[2])
-            m.pose.orientation.w = 1.0
-            m.scale.x = m.scale.y = m.scale.z = MARKER_DIAMETER_M
-            m.color.r = r / 255.0
-            m.color.g = g / 255.0
-            m.color.b = b / 255.0
-            m.color.a = alpha
-            marker_array.markers.append(m)
+        for tid, joints_3d, h36m_conf in skeletons:
+            for j_idx, xyz in enumerate(joints_3d):
+                alpha = confidence_to_alpha(float(h36m_conf[j_idx]))
+                if alpha <= 0.0:
+                    continue
+                mid = joint_marker_id(tid, j_idx)
+                new_ids.add(mid)
+                r, g, b = H36M_JOINT_COLORS[j_idx]
+                m = Marker()
+                m.header.stamp = stamp
+                m.header.frame_id = frame_id
+                m.ns = ns
+                m.id = mid
+                m.type = Marker.SPHERE
+                m.action = Marker.ADD
+                m.pose.position.x = float(xyz[0])
+                m.pose.position.y = float(xyz[1])
+                m.pose.position.z = float(xyz[2])
+                m.pose.orientation.w = 1.0
+                m.scale.x = m.scale.y = m.scale.z = MARKER_DIAMETER_M
+                m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, alpha
+                marker_array.markers.append(m)
+
+            for bone_idx, (j1, j2) in enumerate(H36M_LIMB_SEQ):
+                alpha = confidence_to_alpha(min(float(h36m_conf[j1]), float(h36m_conf[j2])))
+                if alpha <= 0.0:
+                    continue
+                mid = bone_marker_id(tid, bone_idx)
+                new_ids.add(mid)
+                p1, p2 = joints_3d[j1], joints_3d[j2]
+                r, g, b = H36M_LIMB_COLORS[bone_idx]
+                m = Marker()
+                m.header.stamp = stamp
+                m.header.frame_id = frame_id
+                m.ns = ns
+                m.id = mid
+                m.type = Marker.LINE_LIST
+                m.action = Marker.ADD
+                m.points = [
+                    Point(x=float(p1[0]), y=float(p1[1]), z=float(p1[2])),
+                    Point(x=float(p2[0]), y=float(p2[1]), z=float(p2[2])),
+                ]
+                m.scale.x = BONE_LINE_WIDTH_M
+                m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, alpha
+                marker_array.markers.append(m)
 
         for mid in active_ids - new_ids:
             del_m = Marker()
@@ -373,6 +455,26 @@ class Pose3DNode(Node):
         pub.publish(marker_array)
         active_ids.clear()
         active_ids.update(new_ids)
+
+    def _publish_pose_array(self, stamp, skeletons_base: list):
+        msg = PoseArray()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self._base_link_frame
+        for _, joints_base, _ in skeletons_base:
+            yaw = yaw_from_shoulders_base(joints_base)
+            if yaw is None:
+                continue
+            torso = joints_base[H36M_TORSO]
+            pose = Pose()
+            pose.position.x = float(torso[0])
+            pose.position.y = float(torso[1])
+            pose.position.z = float(torso[2])
+            pose.orientation.x = 0.0
+            pose.orientation.y = 0.0
+            pose.orientation.z = float(np.sin(yaw / 2.0))
+            pose.orientation.w = float(np.cos(yaw / 2.0))
+            msg.poses.append(pose)
+        self._pub_poses_base.publish(msg)
 
     def _camera_info_cb(self, msg: CameraInfo):
         self._camera_matrix = np.array(msg.k, dtype=np.float32).reshape(3, 3)
@@ -480,14 +582,15 @@ class Pose3DNode(Node):
         debug = bgr.copy() if self._debug_enabled else None
 
         if results.boxes.id is None:
-            self._publish_marker_array(
+            self._publish_skeleton_markers(
                 self._pub_markers, stamp, self._camera_frame_id, "pose3d",
-                [], {}, self._active_marker_ids,
+                [], self._active_marker_ids,
             )
-            self._publish_marker_array(
+            self._publish_skeleton_markers(
                 self._pub_markers_base, stamp, self._base_link_frame, "pose3d_base",
-                [], {}, self._active_marker_ids_base,
+                [], self._active_marker_ids_base,
             )
+            self._publish_pose_array(stamp, [])
             if debug is not None:
                 self._publish_debug_image(stamp, self._camera_frame_id, debug)
             return
@@ -504,8 +607,11 @@ class Pose3DNode(Node):
             tid = int(tid_raw)
             if tid not in best_idx_for_tid or box_confs[i] > box_confs[best_idx_for_tid[tid]]:
                 best_idx_for_tid[tid] = i
-        frame_indices = list(best_idx_for_tid.values())
-        track_colors = {tid: get_track_color(tid) for tid in best_idx_for_tid}
+        frame_indices = [
+            i for i in best_idx_for_tid.values()
+            if is_valid_coco_detection(scores_all[i], self.kp_thresh)
+        ]
+        track_colors = {int(track_ids[i]): get_track_color(int(track_ids[i])) for i in frame_indices}
 
         if debug is not None:
             for i in frame_indices:
@@ -557,7 +663,7 @@ class Pose3DNode(Node):
             torso_targets.append(torso_3d)
             infer_scores.append(kp_sc)
 
-        joint_entries = []
+        skeletons_cam = []
         if infer_inputs:
             batch = np.stack(infer_inputs, axis=0)
             joints_batch = self._motionbert_infer(batch)
@@ -568,45 +674,37 @@ class Pose3DNode(Node):
                 joints_3d = scale_skeleton_to_meters(joints_3d)
                 joints_3d = place_skeleton_in_camera(joints_3d, torso_3d)
                 h36m_conf = h36m_confidences_from_coco(kp_sc)
-                for j_idx, xyz in enumerate(joints_3d):
-                    alpha = confidence_to_alpha(float(h36m_conf[j_idx]))
-                    if alpha <= 0.0:
-                        continue
-                    joint_entries.append((tid * 100 + j_idx, xyz, tid, alpha))
+                skeletons_cam.append((tid, joints_3d, h36m_conf))
 
-        self._publish_marker_array(
+        self._publish_skeleton_markers(
             self._pub_markers, stamp, self._camera_frame_id, "pose3d",
-            joint_entries, track_colors, self._active_marker_ids,
+            skeletons_cam, self._active_marker_ids,
         )
 
-        base_entries = joint_entries
+        skeletons_base = []
         camera_to_base = self._lookup_camera_to_base(stamp)
-        if camera_to_base is not None and joint_entries:
-            self.get_logger().info(f"Camera to base: {camera_to_base}")
-            xyz_cam = np.stack([xyz for _, xyz, _, _ in joint_entries], axis=0)
-            xyz_base = transform_points(camera_to_base, xyz_cam)
-            base_entries = [
-                (marker_id, xyz_base[i], tid, alpha)
-                for i, (marker_id, _, tid, alpha) in enumerate(joint_entries)
-            ]
-        elif camera_to_base is None and joint_entries:
+        if camera_to_base is not None and skeletons_cam:
+            for tid, joints_3d, h36m_conf in skeletons_cam:
+                joints_base = transform_points(camera_to_base, joints_3d)
+                skeletons_base.append((tid, joints_base, h36m_conf))
+        elif camera_to_base is None and skeletons_cam:
             self.get_logger().warning(
                 f"No TF {self._camera_frame_id} -> {self._base_link_frame}; "
-                "skipping base_link markers",
+                "skipping base_link markers and poses",
                 throttle_duration_sec=5.0,
             )
 
-        self._publish_marker_array(
+        self._publish_skeleton_markers(
             self._pub_markers_base, stamp, self._base_link_frame, "pose3d_base",
-            base_entries if camera_to_base is not None else [],
-            track_colors, self._active_marker_ids_base,
+            skeletons_base, self._active_marker_ids_base,
         )
+        self._publish_pose_array(stamp, skeletons_base)
 
         if debug is not None:
             self._publish_debug_image(stamp, self._camera_frame_id, debug)
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.get_logger().info(
-            f"{len(frame_indices)} tracks | {len(infer_inputs)} posed | {dt_ms:.1f} ms"
+            f"{len(frame_indices)} valid tracks | {len(skeletons_cam)} posed | {dt_ms:.1f} ms"
         )
 
 
@@ -657,6 +755,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--base_link_frame", type=str, default="base_link",
+    )
+    parser.add_argument(
+        "--pose_array_topic", type=str, default="/huipred/pose3d_poses_base_link",
     )
     parser.add_argument(
         "--tf_timeout", type=float, default=0.1,
