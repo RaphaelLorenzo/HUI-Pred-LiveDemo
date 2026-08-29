@@ -6,7 +6,8 @@ Subscribes to RGB, depth, and camera_info, publishes sphere markers for each
 H36M joint in the camera optical frame on /huipred/pose3d_markers, and a debug
 2D overlay on /huipred/pose3d_debug/image_raw, and the same 3D markers transformed
 to base_link on /huipred/pose3d_markers_base_link (via /tf), and yaw-only torso
-PoseArray on /huipred/pose3d_poses_base_link.
+PoseArray on /huipred/pose3d_poses_base_link, and Detection2DArray with 3D torso
+poses on /huipred/pose3d_detections2d_base_link.
 
 Run (Docker / ROS Humble, Python 3.10):
     python3.10 ros2_node_3d_pose.py
@@ -30,6 +31,12 @@ from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
 from geometry_msgs.msg import Point, Pose, PoseArray
 from visualization_msgs.msg import Marker, MarkerArray
+from vision_msgs.msg import (
+    Detection2D,
+    Detection2DArray,
+    ObjectHypothesis,
+    ObjectHypothesisWithPose,
+)
 import message_filters
 
 try:
@@ -276,6 +283,15 @@ def yaw_from_shoulders_base(joints_base: np.ndarray) -> float | None:
     return float(np.arctan2(forward[1], forward[0]))
 
 
+def yaw_quaternion_base(yaw: float) -> tuple[float, float, float, float]:
+    return 0.0, 0.0, float(np.sin(yaw / 2.0)), float(np.cos(yaw / 2.0))
+
+
+def bbox_theta_from_coco_shoulders(kp_xy: np.ndarray) -> float:
+    shoulder_2d = kp_xy[COCO_RIGHT_SHOULDER] - kp_xy[COCO_LEFT_SHOULDER]
+    return float(np.arctan2(-shoulder_2d[1], shoulder_2d[0]) + (np.pi / 2.0))
+
+
 def joint_marker_id(tid: int, joint_idx: int) -> int:
     return tid * 100 + joint_idx
 
@@ -344,6 +360,9 @@ class Pose3DNode(Node):
             MarkerArray, args.base_link_marker_topic, 10
         )
         self._pub_poses_base = self.create_publisher(PoseArray, args.pose_array_topic, 10)
+        self._pub_detections2d_base = self.create_publisher(
+            Detection2DArray, args.detections2d_topic, 10
+        )
         self._debug_enabled = args.debug_image_topic.lower() != "none"
         self._pub_debug = None
         if self._debug_enabled:
@@ -364,7 +383,7 @@ class Pose3DNode(Node):
         self.get_logger().info(
             f"Ready | RGB={args.rgb_topic} depth={depth_topic} "
             f"markers={args.marker_topic} base={args.base_link_marker_topic} "
-            f"poses={args.pose_array_topic} "
+            f"poses={args.pose_array_topic} detections2d={args.detections2d_topic} "
             f"debug={'off' if not self._debug_enabled else args.debug_image_topic}"
         )
 
@@ -487,8 +506,56 @@ class Pose3DNode(Node):
             pose.orientation.z = float(np.sin(yaw / 2.0))
             pose.orientation.w = float(np.cos(yaw / 2.0))
             msg.poses.append(pose)
-        self.get_logger().info(f"Publishing {len(msg.poses)} poses ({len(skeletons_base)} skeletons)")
         self._pub_poses_base.publish(msg)
+
+    def _publish_detections2d_base(
+        self,
+        stamp,
+        skeletons_base: list,
+        track_meta: dict[int, tuple],
+    ):
+        """track_meta: tid -> (bbox_xyxy, box_conf, kp_xy)."""
+        msg = Detection2DArray()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self._base_link_frame
+        for tid, joints_base, _ in skeletons_base:
+            if tid not in track_meta:
+                continue
+            yaw = yaw_from_shoulders_base(joints_base)
+            if yaw is None:
+                continue
+            bbox, box_conf, kp_xy = track_meta[tid]
+            x1, y1, x2, y2 = [float(v) for v in bbox.tolist()]
+            torso = joints_base[H36M_TORSO]
+            qx, qy, qz, qw = yaw_quaternion_base(yaw)
+
+            detection = Detection2D()
+            detection.header.stamp = stamp
+            detection.header.frame_id = self._base_link_frame
+            detection.id = str(tid)
+            detection.bbox.center.position.x = (x1 + x2) / 2.0
+            detection.bbox.center.position.y = (y1 + y2) / 2.0
+            detection.bbox.center.theta = bbox_theta_from_coco_shoulders(kp_xy)
+            detection.bbox.size_x = x2 - x1
+            detection.bbox.size_y = y2 - y1
+
+            hypothesis = ObjectHypothesis()
+            hypothesis.class_id = "person"
+            hypothesis.score = float(box_conf)
+
+            result = ObjectHypothesisWithPose()
+            result.hypothesis = hypothesis
+            result.pose.pose.position.x = float(torso[0])
+            result.pose.pose.position.y = float(torso[1])
+            result.pose.pose.position.z = float(torso[2])
+            result.pose.pose.orientation.x = qx
+            result.pose.pose.orientation.y = qy
+            result.pose.pose.orientation.z = qz
+            result.pose.pose.orientation.w = qw
+            detection.results.append(result)
+            msg.detections.append(detection)
+
+        self._pub_detections2d_base.publish(msg)
 
     def _camera_info_cb(self, msg: CameraInfo):
         self._camera_matrix = np.array(msg.k, dtype=np.float32).reshape(3, 3)
@@ -605,6 +672,7 @@ class Pose3DNode(Node):
                 [], self._active_marker_ids_base,
             )
             self._publish_pose_array(stamp, [])
+            self._publish_detections2d_base(stamp, [], {})
             if debug is not None:
                 self._publish_debug_image(stamp, self._camera_frame_id, debug)
             return
@@ -645,6 +713,7 @@ class Pose3DNode(Node):
                 draw_person_2d(debug, keypoints_all[i], scores_all[i], color)
 
         infer_ids, infer_inputs, torso_targets, infer_scores = [], [], [], []
+        track_meta: dict[int, tuple] = {}
 
         for i in frame_indices:
             tid = int(track_ids[i])
@@ -676,6 +745,7 @@ class Pose3DNode(Node):
             infer_inputs.append(h36m_seq)
             torso_targets.append(torso_3d)
             infer_scores.append(kp_sc)
+            track_meta[tid] = (boxes[i], box_confs[i], kp_xy)
 
         skeletons_cam = []
         if infer_inputs:
@@ -712,6 +782,7 @@ class Pose3DNode(Node):
             skeletons_base, self._active_marker_ids_base,
         )
         self._publish_pose_array(stamp, skeletons_base)
+        self._publish_detections2d_base(stamp, skeletons_base, track_meta)
 
         if debug is not None:
             self._publish_debug_image(stamp, self._camera_frame_id, debug)
@@ -771,6 +842,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--pose_array_topic", type=str, default="/huipred/pose3d_poses_base_link",
+    )
+    parser.add_argument(
+        "--detections2d_topic", type=str,
+        default="/huipred/pose3d_detections2d_base_link",
     )
     parser.add_argument(
         "--tf_timeout", type=float, default=0.1,
