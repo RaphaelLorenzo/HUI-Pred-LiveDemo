@@ -463,6 +463,7 @@ class Pose3DNode(Node):
         for _, joints_base, _ in skeletons_base:
             yaw = yaw_from_shoulders_base(joints_base)
             if yaw is None:
+                self.get_logger().warning("No yaw found for skeleton")
                 continue
             torso = joints_base[H36M_TORSO]
             pose = Pose()
@@ -474,7 +475,7 @@ class Pose3DNode(Node):
             pose.orientation.z = float(np.sin(yaw / 2.0))
             pose.orientation.w = float(np.cos(yaw / 2.0))
             msg.poses.append(pose)
-        self.get_logger().info(f"Publishing {len(msg.poses)} poses to {self._pose_array_topic}")
+        self.get_logger().info(f"Publishing {len(msg.poses)} poses to {self._pub_poses_base.get_topic_name()}")
         self._pub_poses_base.publish(msg)
 
     def _camera_info_cb(self, msg: CameraInfo):
