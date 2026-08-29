@@ -368,15 +368,20 @@ class Pose3DNode(Node):
         )
 
     def _lookup_camera_to_base(self, stamp):
-        try:
-            return self._tf_buffer.lookup_transform(
-                self._base_link_frame,
-                self._camera_frame_id,
-                stamp,
-                timeout=Duration(seconds=self._tf_timeout),
-            )
-        except (LookupException, ConnectivityException, ExtrapolationException):
+        # try:
+        tf_lookup = self._tf_buffer.lookup_transform(
+            self._base_link_frame,
+            self._camera_frame_id,
+            stamp,
+            timeout=Duration(seconds=self._tf_timeout),
+        )
+        if tf_lookup is None:
+            self.get_logger().warning(f"No TF {self._camera_frame_id} -> {self._base_link_frame} found. tf_lookup is None")
             return None
+        return tf_lookup
+        # except (LookupException, ConnectivityException, ExtrapolationException):
+        #     self.get_logger().warning(f"No TF {self._camera_frame_id} -> {self._base_link_frame} found. Error: {traceback.format_exc()}")
+        #     return None
 
     def _publish_skeleton_markers(
         self,
