@@ -706,7 +706,7 @@ class Pose3DNode(Node):
             self._publish_debug_image(stamp, self._camera_frame_id, debug)
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.get_logger().info(
-            f"{len(frame_indices)} valid tracks | {len(skeletons_cam)} posed | {dt_ms:.1f} ms"
+            f"{len(frame_indices)} valid tracks | {len(skeletons_cam)} posed | skeletons_base len: {len(skeletons_base)} | {dt_ms:.1f} ms"
         )
 
 
