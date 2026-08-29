@@ -475,7 +475,7 @@ class Pose3DNode(Node):
             pose.orientation.z = float(np.sin(yaw / 2.0))
             pose.orientation.w = float(np.cos(yaw / 2.0))
             msg.poses.append(pose)
-        self.get_logger().info(f"Publishing {len(msg.poses)} poses to {self._pub_poses_base.get_topic_name()}")
+        self.get_logger().info(f"Publishing {len(msg.poses)} poses ")
         self._pub_poses_base.publish(msg)
 
     def _camera_info_cb(self, msg: CameraInfo):
