@@ -582,6 +582,7 @@ class Pose3DNode(Node):
         base_entries = joint_entries
         camera_to_base = self._lookup_camera_to_base(stamp)
         if camera_to_base is not None and joint_entries:
+            self.get_logger().info(f"Camera to base: {camera_to_base}")
             xyz_cam = np.stack([xyz for _, xyz, _, _ in joint_entries], axis=0)
             xyz_base = transform_points(camera_to_base, xyz_cam)
             base_entries = [
