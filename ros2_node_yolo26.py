@@ -21,21 +21,9 @@ from functools import partial
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image as RosImage
+from sensor_msgs.msg import CompressedImage, Image as RosImage
 from std_msgs.msg import Float32MultiArray, String
-from vision_msgs.msg import (
-    Detection2D,
-    Detection2DArray,
-    ObjectHypothesis,
-    ObjectHypothesisWithPose,
-)
-from visualization_msgs.msg import Marker, MarkerArray
 import message_filters
-
-try:
-    from cv_bridge import CvBridge
-except ImportError:
-    CvBridge = None
 
 
 # WARNING : this is very weird : but if ultralytics is imported after torch, the YOLO model does not work (no detections !)
@@ -91,11 +79,6 @@ COCO_SKELETON = [
     [8, 10], [1, 2], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6],
 ]
 
-PERSON_CUBE_DEPTH_M = 0.3
-PERSON_CUBE_WIDTH_M = 0.6
-PERSON_CUBE_HEIGHT_M = 1.8
-LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
-
 METADATA_CKPT_COLUMNS = [
     "recording", "episode", "image_height", "image_width",
     "unique_track_identifier", "track_id", "image_file", "image_index",
@@ -108,24 +91,22 @@ METADATA_CKPT_COLUMNS = [
 # Helper functions (ported from folder_demo_yolo26.py)
 # ---------------------------------------------------------------------------
 
-def estimate_torso_depth_and_center(
+def estimate_torso_depth(
     keypoints: np.ndarray,
     scores: np.ndarray,
     depth_image: np.ndarray,
     kp_thresh: float,
-    logger,
 ):
     """
-    Estimate torso center pixel and depth from diagonal depth sampling.
+    Estimate depth at the center of the torso using diagonal sampling.
 
-    Samples 5 points on each torso diagonal, keeps valid depth values only, and
-    returns the median depth together with the median sampled pixel location.
+    Uses 6 points: 3 sampled at 0.25, 0.5, 0.75 on diagonal left_shoulder->right_hip
+    and 3 on diagonal right_shoulder->left_hip.  Takes median of valid samples.
     """
     LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
     LEFT_HIP, RIGHT_HIP = 11, 12
-    sample_ratios = np.linspace(1.0 / 6.0, 5.0 / 6.0, 5)
+    sample_ratios = [0.25, 0.5, 0.75]
     depth_samples = []
-    sample_points = []
     h, w = depth_image.shape[:2]
 
     if scores[LEFT_SHOULDER] > kp_thresh and scores[RIGHT_HIP] > kp_thresh:
@@ -133,252 +114,18 @@ def estimate_torso_depth_and_center(
         for r in sample_ratios:
             x, y = int(pt1[0] + r * (pt2[0] - pt1[0])), int(pt1[1] + r * (pt2[1] - pt1[1]))
             if 0 <= x < w and 0 <= y < h:
-                depth_value = float(depth_image[y, x])
-                if np.isfinite(depth_value) and depth_value > 0:
-                    depth_samples.append(depth_value)
-                    sample_points.append((float(x), float(y)))
-    else:
-        logger.info(f"Left shoulder score: {scores[LEFT_SHOULDER]} | Right hip score: {scores[RIGHT_HIP]} | Insufficient")
-                
+                depth_samples.append(depth_image[y, x])
 
     if scores[RIGHT_SHOULDER] > kp_thresh and scores[LEFT_HIP] > kp_thresh:
         pt1, pt2 = keypoints[RIGHT_SHOULDER], keypoints[LEFT_HIP]
         for r in sample_ratios:
             x, y = int(pt1[0] + r * (pt2[0] - pt1[0])), int(pt1[1] + r * (pt2[1] - pt1[1]))
             if 0 <= x < w and 0 <= y < h:
-                depth_value = float(depth_image[y, x])
-                if np.isfinite(depth_value) and depth_value > 0:
-                    depth_samples.append(depth_value)
-                    sample_points.append((float(x), float(y)))
-    else:
-        logger.info(f"Right shoulder score: {scores[RIGHT_SHOULDER]} | Left hip score: {scores[LEFT_HIP]} | Insufficient")
+                depth_samples.append(depth_image[y, x])
 
-    if len(depth_samples) < 3:
-        logger.warn("Not enough depth samples to estimate torso center and depth")
-        return None, None
-
-    sample_points_array = np.array(sample_points, dtype=np.float32)
-    torso_center_uv = np.median(sample_points_array, axis=0)
-    torso_depth = float(np.median(np.array(depth_samples, dtype=np.float32)))
-    return torso_depth, torso_center_uv
-
-
-def project_pixel_to_3d(
-    pixel_xy: np.ndarray,
-    depth_m: float,
-    camera_matrix: np.ndarray,
-):
-    """Project one image pixel with depth into camera-frame 3D coordinates."""
-    if pixel_xy is None or depth_m is None or depth_m <= 0 or camera_matrix is None:
-        return None
-
-    fx = float(camera_matrix[0, 0])
-    fy = float(camera_matrix[1, 1])
-    cx = float(camera_matrix[0, 2])
-    cy = float(camera_matrix[1, 2])
-    if fx == 0.0 or fy == 0.0:
-        return None
-
-    u = float(pixel_xy[0])
-    v = float(pixel_xy[1])
-    x = (u - cx) * depth_m / fx
-    y = (v - cy) * depth_m / fy
-    z = depth_m
-    return np.array([x, y, z], dtype=np.float32)
-
-
-def _sample_depth_m_at_pixel(
-    pixel_uv: np.ndarray,
-    depth_image: np.ndarray | None,
-    depth_scale: float,
-    fallback_depth_m: float | None,
-) -> float | None:
-    """Return depth in meters at a pixel, or fallback depth when unavailable."""
-    if depth_image is not None:
-        h, w = depth_image.shape[:2]
-        x, y = int(pixel_uv[0]), int(pixel_uv[1])
-        if 0 <= x < w and 0 <= y < h:
-            depth_raw = float(depth_image[y, x])
-            if np.isfinite(depth_raw) and depth_raw > 0:
-                return depth_raw / depth_scale
-    return fallback_depth_m
-
-
-def _quaternion_from_rotation_matrix(rot: np.ndarray) -> tuple[float, float, float, float]:
-    """Quaternion (x, y, z, w) from a 3x3 rotation matrix (local-to-parent)."""
-    m = np.asarray(rot, dtype=np.float64)
-    trace = float(m[0, 0] + m[1, 1] + m[2, 2])
-    if trace > 0.0:
-        s = np.sqrt(trace + 1.0) * 2.0
-        return (
-            float((m[2, 1] - m[1, 2]) / s),
-            float((m[0, 2] - m[2, 0]) / s),
-            float((m[1, 0] - m[0, 1]) / s),
-            float(0.25 * s),
-        )
-    if m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
-        return (
-            float(0.25 * s),
-            float((m[0, 1] + m[1, 0]) / s),
-            float((m[0, 2] + m[2, 0]) / s),
-            float((m[2, 1] - m[1, 2]) / s),
-        )
-    if m[1, 1] > m[2, 2]:
-        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
-        return (
-            float((m[0, 1] + m[1, 0]) / s),
-            float(0.25 * s),
-            float((m[1, 2] + m[2, 1]) / s),
-            float((m[0, 2] - m[2, 0]) / s),
-        )
-    s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
-    return (
-        float((m[0, 2] + m[2, 0]) / s),
-        float((m[1, 2] + m[2, 1]) / s),
-        float(0.25 * s),
-        float((m[1, 0] - m[0, 1]) / s),
-    )
-
-
-def _normalize_horizontal_axis(axis: np.ndarray) -> np.ndarray | None:
-    """Keep only the camera X/Z components (Y is down in the optical frame)."""
-    axis = np.asarray(axis, dtype=np.float32).copy()
-    axis[1] = 0.0
-    norm = float(np.linalg.norm(axis))
-    if norm < 1e-6:
-        return None
-    return axis / norm
-
-
-def _body_orientation_from_width(width_dir: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Build a right-handed body frame in the optical frame (x right, y down, z front).
-
-    Local axes used by the cube marker:
-    - X: width (shoulder line, horizontal)
-    - Y: depth (body forward)
-    - Z: height (up = -camera Y)
-    """
-    up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-    width_dir = _normalize_horizontal_axis(width_dir)
-    if width_dir is None:
-        return None
-    forward_dir = np.cross(up_cam, width_dir)
-    forward_dir = _normalize_horizontal_axis(forward_dir)
-    if forward_dir is None:
-        return None
-    return width_dir, forward_dir, up_cam
-
-
-def _width_dir_from_shoulders(
-    left_uv: np.ndarray,
-    right_uv: np.ndarray,
-    left_3d: np.ndarray | None,
-    right_3d: np.ndarray | None,
-    torso_depth_m: float | None,
-    camera_matrix: np.ndarray | None,
-) -> np.ndarray | None:
-    """Estimate the horizontal shoulder-width axis in the camera optical frame."""
-    if left_3d is not None and right_3d is not None:
-        return _normalize_horizontal_axis(left_3d - right_3d)
-
-    if (
-        torso_depth_m is not None
-        and torso_depth_m > 0.0
-        and camera_matrix is not None
-    ):
-        left_3d_est = project_pixel_to_3d(left_uv, torso_depth_m, camera_matrix)
-        right_3d_est = project_pixel_to_3d(right_uv, torso_depth_m, camera_matrix)
-        if left_3d_est is not None and right_3d_est is not None:
-            return _normalize_horizontal_axis(left_3d_est - right_3d_est)
-
-    shoulder_2d = right_uv - left_uv
-    if float(np.linalg.norm(shoulder_2d)) < 1e-6:
-        return None
-    # Pixel u maps to camera +X; ignore dv for yaw-only orientation.
-    return _normalize_horizontal_axis(np.array([shoulder_2d[0], 0.0, 0.0], dtype=np.float32))
-
-
-def _quaternion_from_body_axes(
-    width_dir: np.ndarray,
-    forward_dir: np.ndarray,
-    up_dir: np.ndarray,
-) -> tuple[float, float, float, float]:
-    """Quaternion aligning local X=width, Y=depth/forward, Z=height/up."""
-    rot = np.stack(
-        [
-            np.asarray(width_dir, dtype=np.float32),
-            np.asarray(forward_dir, dtype=np.float32),
-            np.asarray(up_dir, dtype=np.float32),
-        ],
-        axis=1,
-    )
-    if float(np.linalg.det(rot)) < 0.0:
-        forward_dir = -np.asarray(forward_dir, dtype=np.float32)
-        rot[:, 1] = forward_dir
-    return _quaternion_from_rotation_matrix(rot)
-
-
-def compute_person_pose_from_shoulders(
-    keypoints: np.ndarray,
-    scores: np.ndarray,
-    depth_image: np.ndarray | None,
-    camera_matrix: np.ndarray | None,
-    depth_scale: float,
-    kp_thresh: float,
-    torso_center_uv: np.ndarray | None,
-    torso_depth_m: float | None,
-) -> dict | None:
-    """Estimate yaw-only person pose from both shoulders (pitch=roll=0).
-
-    Returns None when either shoulder is missing/unconfident.
-    """
-    if scores[LEFT_SHOULDER] <= kp_thresh or scores[RIGHT_SHOULDER] <= kp_thresh:
-        return None
-
-    left_uv = np.asarray(keypoints[LEFT_SHOULDER], dtype=np.float32)
-    right_uv = np.asarray(keypoints[RIGHT_SHOULDER], dtype=np.float32)
-
-    left_depth_m = _sample_depth_m_at_pixel(left_uv, depth_image, depth_scale, torso_depth_m)
-    right_depth_m = _sample_depth_m_at_pixel(right_uv, depth_image, depth_scale, torso_depth_m)
-    left_3d = (
-        project_pixel_to_3d(left_uv, left_depth_m, camera_matrix)
-        if left_depth_m is not None and camera_matrix is not None
-        else None
-    )
-    right_3d = (
-        project_pixel_to_3d(right_uv, right_depth_m, camera_matrix)
-        if right_depth_m is not None and camera_matrix is not None
-        else None
-    )
-
-    width_dir = _width_dir_from_shoulders(
-        left_uv,
-        right_uv,
-        left_3d,
-        right_3d,
-        torso_depth_m,
-        camera_matrix,
-    )
-    axes = _body_orientation_from_width(width_dir) if width_dir is not None else None
-    if axes is None:
-        return None
-    width_dir, forward_dir, up_dir = axes
-
-    position = None
-    if torso_center_uv is not None and torso_depth_m is not None and camera_matrix is not None:
-        position = project_pixel_to_3d(torso_center_uv, torso_depth_m, camera_matrix)
-    elif left_3d is not None and right_3d is not None:
-        position = 0.5 * (left_3d + right_3d)
-
-    quat = _quaternion_from_body_axes(width_dir, forward_dir, up_dir)
-    shoulder_2d = right_uv - left_uv
-    bbox_theta = float(np.arctan2(-shoulder_2d[1], shoulder_2d[0]) + (np.pi / 2.0))
-    return {
-        "position": position,
-        "orientation": quat,
-        "bbox_theta": bbox_theta,
-    }
+    if len(depth_samples) == 0:
+        return -1.0
+    return float(np.median(depth_samples))
 
 
 def load_model_from_config(config: dict, device: torch.device):
@@ -617,17 +364,10 @@ class HUIPredNode(Node):
         rgb_topic = args.rgb_topic
         depth_topic = args.depth_topic or ""
         self.depth_topic = depth_topic
-        self.compressed_depth = (
-            depth_topic.endswith("/compressed")
-            or depth_topic.endswith("/compressedDepth")
-            or "/compressedDepth/" in depth_topic
-        )
+        self.compressed_depth = "compressed" in depth_topic
         yolo_path = args.yolo_model_path
         ip_ckpt = args.interaction_prediction_checkpoint or ""
         self._use_depth = depth_topic != ""
-        self.camera_info_topic = args.camera_info_topic or ""
-        self._camera_matrix = None
-        self._camera_frame_id = "camera_optical_frame"
 
         # Args-like namespace consumed by helper functions
         self._args = types.SimpleNamespace(
@@ -722,30 +462,16 @@ class HUIPredNode(Node):
         self.filter_length = args.filter_length
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._process_lock = threading.Lock()
-        self._cv_bridge = CvBridge() if CvBridge is not None else None
-        if self._use_depth and self.compressed_depth and self._cv_bridge is None:
-            self.get_logger().warning(
-                "cv_bridge is unavailable; compressed depth decoding falls back to OpenCV PNG decode only"
-            )
 
         # -- Publisher: /huipred/overlay (annotated image with detections) --
         self._pub_overlay = self.create_publisher(
             CompressedImage, "/huipred/overlay/compressed", 10
         )
 
-        # -- Publisher: /huipred/tracks (flat float array; metadata + track payload) --
+        # -- Publisher: /huipred/tracks (flat float array; 8 floats per track) --
+        # Per track: [x1, y1, x2, y2, conf, depth(-1 if none), ip_output(-1 if none), ip_output_filtered(-1 if none)]
         self._pub_tracks = self.create_publisher(
             Float32MultiArray, "/huipred/tracks", 10
-        )
-
-        # -- Publisher: /huipred/torso_markers (oriented person cubes colored by IP score) --
-        self._pub_torso_markers = self.create_publisher(
-            MarkerArray, "/huipred/torso_markers", 10
-        )
-
-        # -- Publisher: /huipred/tracks_detections2d (2D bboxes + 3D torso poses) --
-        self._pub_tracks_detections2d = self.create_publisher(
-            Detection2DArray, "/huipred/tracks_detections2d", 10
         )
         self._overlay_mode = args.overlay_mode
         self.get_logger().info(f"Overlay mode: {self._overlay_mode}")
@@ -767,17 +493,8 @@ class HUIPredNode(Node):
 
         # -- Subscribers --
         if self._use_depth:
-            depth_mode = "CompressedImage" if self.compressed_depth else "Image"
             self.get_logger().info(
-                f"Subscribing (synced): RGB={rgb_topic}  Depth={depth_topic} ({depth_mode})"
-            )
-            if self.camera_info_topic == "":
-                raise ValueError("camera_info_topic is required when depth is enabled")
-            self._sub_camera_info = self.create_subscription(
-                CameraInfo,
-                self.camera_info_topic,
-                self._camera_info_cb,
-                10,
+                f"Subscribing (synced): RGB={rgb_topic}  Depth={depth_topic}"
             )
             self._sub_rgb = message_filters.Subscriber(self, CompressedImage, rgb_topic)
             if self.compressed_depth:
@@ -785,7 +502,7 @@ class HUIPredNode(Node):
             else:
                 self._sub_depth = message_filters.Subscriber(self, RosImage, depth_topic)
             self._sync = message_filters.ApproximateTimeSynchronizer(
-                [self._sub_rgb, self._sub_depth], queue_size=50, slop=0.5,
+                [self._sub_rgb, self._sub_depth], queue_size=10, slop=0.1,
             )
             self._sync.registerCallback(self._synced_cb)
         else:
@@ -805,75 +522,23 @@ class HUIPredNode(Node):
         return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
     @staticmethod
-    def _extract_png_payload(raw: bytes):
-        """Return the byte slice containing a PNG payload, if any."""
-        png_magic = b"\x89PNG\r\n\x1a\n"
-        png_offset = raw.find(png_magic)
-        if png_offset >= 0:
-            return raw[png_offset:]
-
-        if len(raw) > 12:
-            # ROS compressedDepth transport prepends a 12-byte config header.
-            payload = raw[12:]
-            if payload.startswith(png_magic):
-                return payload
-        return None
-
-    def _decode_compressed_depth(self, msg: CompressedImage):
+    def _decode_compressed_depth(msg: CompressedImage):
         """Decode a CompressedImage carrying depth data.
 
-        Prefers cv_bridge for RealSense/ROS compressedDepth messages, then falls
-        back to OpenCV PNG decoding.
+        Handles both raw-compressed (PNG/TIFF) and the ROS compressedDepth
+        transport plugin format (12-byte header before the PNG payload).
         """
         raw = bytes(msg.data)
-        fmt = (msg.format or "").lower()
-        if len(raw) == 0:
-            self.get_logger().warn(
-                f"Compressed depth message is empty (format='{msg.format}')"
-            )
-            return None
+        fmt = msg.format.lower()
 
-        if self._cv_bridge is not None:
-            try:
-                depth = self._cv_bridge.compressed_imgmsg_to_cv2(
-                    msg, desired_encoding="passthrough"
-                )
-                if depth is not None and depth.size > 0:
-                    if depth.ndim == 3:
-                        depth = depth[:, :, 0]
-                    return depth
-            except Exception as e:
-                self.get_logger().warning(
-                    f"cv_bridge compressed depth decode failed (format='{msg.format}', "
-                    f"bytes={len(raw)}): {e}"
-                )
+        if "compresseddepth" in fmt:
+            # compressedDepth transport: 12-byte ConfigHeader then PNG/RVL
+            if len(raw) <= 12:
+                return None
+            raw = raw[12:]
 
-        png_payload = self._extract_png_payload(raw)
-        if png_payload is None:
-            self.get_logger().warn(
-                "Compressed depth payload is not PNG (possibly RVL). "
-                f"Use the raw depth topic instead of '/compressed' "
-                f"(format='{msg.format}', bytes={len(raw)})."
-            )
-            return None
-
-        buf = np.frombuffer(png_payload, dtype=np.uint8)
-        if buf.size == 0:
-            self.get_logger().warn(
-                f"Compressed depth PNG payload is empty (format='{msg.format}')"
-            )
-            return None
-
-        depth = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-        if depth is None:
-            self.get_logger().warn(
-                f"OpenCV failed to decode compressed depth PNG "
-                f"(format='{msg.format}', bytes={len(raw)})"
-            )
-            return None
-        if depth.ndim == 3:
-            depth = depth[:, :, 0]
-        return depth
+        buf = np.frombuffer(raw, dtype=np.uint8)
+        return cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
 
     @staticmethod
     def _decode_depth_image(msg: RosImage, logger):
@@ -884,79 +549,36 @@ class HUIPredNode(Node):
         - 32FC1 -> float32 depth
         """
         if msg.height == 0 or msg.width == 0:
-            logger.warn(
-                f"Depth image has invalid shape {msg.width}x{msg.height} "
-                f"(encoding='{msg.encoding}')"
-            )
             return None
 
         enc = (msg.encoding or "").lower()
 
         if enc in ("16uc1", "mono16"):
             dtype = np.dtype(np.uint16)
+            channels = 1
         elif enc == "32fc1":
             dtype = np.dtype(np.float32)
+            channels = 1
         else:
-            logger.warn(f"Unsupported depth encoding: '{msg.encoding}'")
+            logger.warn(f"Unsupported depth encoding: {enc}")
             return None
 
+        # Respect endianness from ROS message.
         if msg.is_bigendian:
             dtype = dtype.newbyteorder(">")
         else:
             dtype = dtype.newbyteorder("<")
 
-        bytes_per_pixel = dtype.itemsize
-        row_stride_bytes = msg.step if msg.step > 0 else msg.width * bytes_per_pixel
-        expected_bytes = row_stride_bytes * msg.height
-        if len(msg.data) < expected_bytes:
-            logger.warn(
-                f"Depth image data too short: got {len(msg.data)} bytes, "
-                f"expected at least {expected_bytes} "
-                f"({msg.width}x{msg.height}, step={msg.step}, encoding='{msg.encoding}')"
-            )
-            return None
-
         try:
             arr = np.frombuffer(msg.data, dtype=dtype)
-            row_stride_elems = row_stride_bytes // bytes_per_pixel
-            arr = arr.reshape((msg.height, row_stride_elems))[:, :msg.width]
-            return np.ascontiguousarray(arr)
+            expected_pixels = msg.height * msg.width * channels
+            if arr.size < expected_pixels:
+                return None
+            arr = arr[:expected_pixels].reshape((msg.height, msg.width))
+            return arr
         except Exception as e:
-            logger.warn(
-                f"Failed to decode depth image ({msg.width}x{msg.height}, "
-                f"step={msg.step}, encoding='{msg.encoding}'): {e}"
-            )
+            logger.warn(f"Failed to decode depth image: {e}")
             return None
-
-    def _describe_depth_message(self, depth_msg):
-        """Summarize a depth message for decode-failure logs."""
-        if isinstance(depth_msg, CompressedImage):
-            return (
-                f"type=CompressedImage format='{depth_msg.format}' "
-                f"bytes={len(depth_msg.data)}"
-            )
-        return (
-            f"type=Image encoding='{depth_msg.encoding}' "
-            f"size={depth_msg.width}x{depth_msg.height} step={depth_msg.step} "
-            f"bytes={len(depth_msg.data)}"
-        )
-
-    def _log_depth_decode_failure(self, depth_msg):
-        mode = "compressed" if self.compressed_depth else "raw"
-        self.get_logger().warn(
-            f"Failed to decode depth message ({mode}, topic='{self.depth_topic}', "
-            f"{self._describe_depth_message(depth_msg)}). "
-            "If using RealSense, prefer the raw topic "
-            "'.../aligned_depth_to_color/image_raw' (no /compressedDepth suffix)."
-        )
-
-    def _camera_info_cb(self, msg: CameraInfo):
-        """Cache the latest camera intrinsic matrix for 3D projection."""
-        try:
-            self._camera_matrix = np.array(msg.k, dtype=np.float32).reshape(3, 3)
-            self._camera_frame_id = msg.header.frame_id
-        except Exception as e:
-            self.get_logger().warn(f"Failed to parse camera info: {e}")
 
     # ----- overlay / eye animation builders -----------------------------------
 
@@ -1010,103 +632,6 @@ class HUIPredNode(Node):
                 if score > args.kp_thresh:
                     cv2.circle(overlay, (int(kp_pt[0]), int(kp_pt[1])), 4, color, -1)
         return overlay
-
-    @staticmethod
-    def _latest_ip_score(track_history: dict) -> float | None:
-        """Return the latest valid IP score for marker coloring, or None if not computed."""
-        if not track_history.get("ip_output"):
-            return None
-        value = track_history["ip_output"][-1]
-        if isinstance(value, (int, float, np.floating)):
-            return float(value)
-        return None
-
-    @staticmethod
-    def _ip_score_to_marker_rgba(ip_score: float | None) -> tuple[float, float, float, float]:
-        """Gray when IP is not computed; red (0) to green (1) otherwise."""
-        if ip_score is None:
-            return 0.5, 0.5, 0.5, 1.0
-        value = max(0.0, min(1.0, float(ip_score)))
-        return 1.0 - value, value, 0.0, 1.0
-
-    @staticmethod
-    def _make_person_cube_marker(
-        stamp,
-        frame_id: str,
-        track_id: int,
-        position_xyz: np.ndarray,
-        orientation_xyzw: tuple[float, float, float, float],
-        ip_score: float | None,
-    ) -> Marker:
-        """Build a human-sized cube marker at the torso, oriented with body yaw."""
-        marker = Marker()
-        marker.header.stamp = stamp
-        marker.header.frame_id = frame_id
-        marker.ns = "huipred_torso"
-        marker.id = track_id
-        marker.type = Marker.CUBE
-        marker.action = Marker.ADD
-        marker.pose.position.x = float(position_xyz[0])
-        marker.pose.position.y = float(position_xyz[1])
-        marker.pose.position.z = float(position_xyz[2])
-        qx, qy, qz, qw = orientation_xyzw
-        marker.pose.orientation.x = qx
-        marker.pose.orientation.y = qy
-        marker.pose.orientation.z = qz
-        marker.pose.orientation.w = qw
-        marker.scale.x = PERSON_CUBE_WIDTH_M
-        marker.scale.y = PERSON_CUBE_DEPTH_M
-        marker.scale.z = PERSON_CUBE_HEIGHT_M
-        red, green, blue, alpha = HUIPredNode._ip_score_to_marker_rgba(ip_score)
-        marker.color.r = red
-        marker.color.g = green
-        marker.color.b = blue
-        marker.color.a = alpha
-        return marker
-
-    @staticmethod
-    def _make_track_detection2d(
-        stamp,
-        frame_id: str,
-        track_id: int,
-        bbox_xyxy: np.ndarray,
-        box_conf: float,
-        person_pose: dict,
-    ) -> Detection2D:
-        """Build a Detection2D with bbox, track id, torso pose, and yaw orientation."""
-        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy.tolist()]
-        detection = Detection2D()
-        detection.header.stamp = stamp
-        detection.header.frame_id = frame_id
-        detection.id = str(track_id)
-        detection.bbox.center.position.x = (x1 + x2) / 2.0
-        detection.bbox.center.position.y = (y1 + y2) / 2.0
-        detection.bbox.center.theta = person_pose["bbox_theta"]
-        detection.bbox.size_x = x2 - x1
-        detection.bbox.size_y = y2 - y1
-
-        hypothesis = ObjectHypothesis()
-        hypothesis.class_id = "person"
-        hypothesis.score = float(box_conf)
-
-        result = ObjectHypothesisWithPose()
-        result.hypothesis = hypothesis
-        position = person_pose["position"]
-        if position is not None:
-            result.pose.pose.position.x = float(position[0])
-            result.pose.pose.position.y = float(position[1])
-            result.pose.pose.position.z = float(position[2])
-        else:
-            result.pose.pose.position.x = -1.0
-            result.pose.pose.position.y = -1.0
-            result.pose.pose.position.z = -1.0
-        qx, qy, qz, qw = person_pose["orientation"]
-        result.pose.pose.orientation.x = qx
-        result.pose.pose.orientation.y = qy
-        result.pose.pose.orientation.z = qz
-        result.pose.pose.orientation.w = qw
-        detection.results.append(result)
-        return detection
 
     @staticmethod
     def _build_eye_animation_image(
@@ -1190,9 +715,9 @@ class HUIPredNode(Node):
             self.get_logger().warn("Failed to decode RGB message")
             return
         if depth is None:
-            self._log_depth_decode_failure(depth_msg)
+            self.get_logger().warn("Failed to decode depth message")
             return
-        self._process_frame(bgr, depth, rgb_msg.header.stamp)
+        self._process_frame(bgr, depth)
 
     def _rgb_only_cb(self, rgb_msg: CompressedImage):
         time_elapsed = time.perf_counter() - self._last_received_rgb_time
@@ -1202,7 +727,7 @@ class HUIPredNode(Node):
         if bgr is None:
             self.get_logger().warn("Failed to decode RGB message")
             return
-        self._process_frame(bgr, None, rgb_msg.header.stamp)
+        self._process_frame(bgr, None)
 
     # ----- dynamic estimation mode ------------------------------------------
 
@@ -1228,7 +753,7 @@ class HUIPredNode(Node):
 
     # ----- main per-frame pipeline -------------------------------------------
 
-    def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray, image_stamp):
+    def _process_frame(self, bgr: np.ndarray, depth_image: np.ndarray):
         
         if not self._process_lock.acquire(blocking=False):
             self.get_logger().info("Skipping frame — previous frame still processing")
@@ -1243,11 +768,11 @@ class HUIPredNode(Node):
                 else:
                     self.get_logger().info(f"Processed frame — time difference is enough: {time_elapsed:.4f}s. Will process and reset last processed time.")
                     self._last_processed_rgb_time = time.perf_counter()
-            self._process_frame_locked(bgr, depth_image, image_stamp)
+            self._process_frame_locked(bgr, depth_image)
         finally:
             self._process_lock.release()
 
-    def _process_frame_locked(self, bgr: np.ndarray, depth_image: np.ndarray, image_stamp):
+    def _process_frame_locked(self, bgr: np.ndarray, depth_image: np.ndarray):
         t_start = time.perf_counter()
         t_ip = 0.0
         args = self._args
@@ -1275,9 +800,6 @@ class HUIPredNode(Node):
             current_track_ids = []
             boxes = confs = keypoints_all = scores_all = []
             depths = []
-            torso_pixels = []
-            torso_positions_3d = []
-            person_poses = []
         else:
             current_track_ids = results.boxes.id.int().cpu().numpy()
             boxes = results.boxes.xyxy.cpu().numpy()
@@ -1291,55 +813,14 @@ class HUIPredNode(Node):
             scores_all = scores_all.cpu().numpy()
 
             depths = []
-            torso_pixels = []
-            torso_positions_3d = []
-            person_poses = []
             if depth_image is not None:
                 for i in range(len(current_track_ids)):
-                    d_raw, torso_center_uv = estimate_torso_depth_and_center(
-                        keypoints_all[i], scores_all[i], depth_image, args.kp_thresh, self.get_logger()
+                    d_raw = estimate_torso_depth(
+                        keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
                     )
-                    depth_m = d_raw / args.depth_scale if d_raw is not None else None
-                    depths.append(depth_m)
-                    torso_pixels.append(torso_center_uv)
-                    if self._camera_matrix is None:
-                        self.get_logger().warn("Camera matrix is not set, 3D projection will fail")
-                    torso_positions_3d.append(
-                        project_pixel_to_3d(
-                            torso_center_uv,
-                            depth_m,
-                            self._camera_matrix,
-                        )
-                    )
-                    person_poses.append(
-                        compute_person_pose_from_shoulders(
-                            keypoints_all[i],
-                            scores_all[i],
-                            depth_image,
-                            self._camera_matrix,
-                            args.depth_scale,
-                            args.kp_thresh,
-                            torso_center_uv,
-                            depth_m,
-                        )
-                    )
+                    depths.append(d_raw / args.depth_scale if d_raw > 0 else None)
             else:
                 depths = [None] * len(current_track_ids)
-                torso_pixels = [None] * len(current_track_ids)
-                torso_positions_3d = [None] * len(current_track_ids)
-                for i in range(len(current_track_ids)):
-                    person_poses.append(
-                        compute_person_pose_from_shoulders(
-                            keypoints_all[i],
-                            scores_all[i],
-                            None,
-                            self._camera_matrix,
-                            args.depth_scale,
-                            args.kp_thresh,
-                            None,
-                            None,
-                        )
-                    )
 
             for i, tid in enumerate(current_track_ids):
                 tid = int(tid)
@@ -1354,8 +835,7 @@ class HUIPredNode(Node):
                     "bbox": boxes[i].tolist(),
                     "conf": float(confs[i]),
                     "depth": depths[i] if depths[i] is not None else None,
-                    "torso_pixel": torso_pixels[i].tolist() if torso_pixels[i] is not None else None,
-                    "torso_position_3d": torso_positions_3d[i].tolist() if torso_positions_3d[i] is not None else None,
+                    # **({"depth": depths[i]} if depths[i] is not None else {}),
                 })
                 self.track_history[tid]["poses"].append({
                     "frame": self.frame_idx,
@@ -1455,7 +935,7 @@ class HUIPredNode(Node):
         if img is not None:
             img_msg = CompressedImage()
             img_msg.header.stamp = self.get_clock().now().to_msg()
-            img_msg.header.frame_id = self._camera_frame_id
+            img_msg.header.frame_id = "camera_optical_frame"
             img_msg.format = "jpeg"
             img_msg.data = np.array(cv2.imencode(".jpg", img)[1]).tobytes()
             self._pub_overlay.publish(img_msg)
@@ -1475,19 +955,6 @@ class HUIPredNode(Node):
                 depth = _depth_default_value
                 if depths[i] is not None:
                     depth = float(depths[i])
-
-                torso_u = -1.0
-                torso_v = -1.0
-                torso_x = -1.0
-                torso_y = -1.0
-                torso_z = depth
-                if torso_pixels[i] is not None:
-                    torso_u = float(torso_pixels[i][0])
-                    torso_v = float(torso_pixels[i][1])
-                if torso_positions_3d[i] is not None:
-                    torso_x = float(torso_positions_3d[i][0])
-                    torso_y = float(torso_positions_3d[i][1])
-                    torso_z = float(torso_positions_3d[i][2])
 
                 # IP outputs
                 ip_out = -1.0
@@ -1530,11 +997,6 @@ class HUIPredNode(Node):
                                     y2, 
                                     conf, 
                                     depth, 
-                                    torso_u,
-                                    torso_v,
-                                    torso_x,
-                                    torso_y,
-                                    torso_z,
                                     ip_out, 
                                     ip_out_f, 
                                     t_infer, 
@@ -1543,54 +1005,6 @@ class HUIPredNode(Node):
 
             tracks_msg.data = tracks_data
             self._pub_tracks.publish(tracks_msg)
-
-            # Publish oriented person cubes for valid shoulder-based poses.
-            stamp = image_stamp
-            torso_markers_msg = MarkerArray()
-            clear_marker = Marker()
-            clear_marker.header.stamp = stamp
-            clear_marker.header.frame_id = self._camera_frame_id
-            clear_marker.action = Marker.DELETEALL
-            clear_marker.ns = "huipred_torso"
-            torso_markers_msg.markers.append(clear_marker)
-            for i, tid_raw in enumerate(current_track_ids):
-                person_pose = person_poses[i]
-                if person_pose is None or person_pose["position"] is None:
-                    continue
-                tid = int(tid_raw)
-                ip_score = None
-                if tid in self.track_history:
-                    ip_score = self._latest_ip_score(self.track_history[tid])
-                torso_markers_msg.markers.append(
-                    self._make_person_cube_marker(
-                        stamp,
-                        self._camera_frame_id,
-                        tid,
-                        person_pose["position"],
-                        person_pose["orientation"],
-                        ip_score,
-                    )
-                )
-            self._pub_torso_markers.publish(torso_markers_msg)
-
-            detections2d_msg = Detection2DArray()
-            detections2d_msg.header.stamp = stamp
-            detections2d_msg.header.frame_id = self._camera_frame_id
-            for i, tid_raw in enumerate(current_track_ids):
-                person_pose = person_poses[i]
-                if person_pose is None:
-                    continue
-                detections2d_msg.detections.append(
-                    self._make_track_detection2d(
-                        stamp,
-                        self._camera_frame_id,
-                        int(tid_raw),
-                        boxes[i],
-                        float(confs[i]) if len(confs) else -1.0,
-                        person_pose,
-                    )
-                )
-            self._pub_tracks_detections2d.publish(detections2d_msg)
 
         t_total = time.perf_counter() - t_start
         self.get_logger().info(
@@ -1603,28 +1017,14 @@ class HUIPredNode(Node):
 
 # ---------------------------------------------------------------------------
 
-def main(parsed_args, ros_args):
-    rclpy.init(args=ros_args)
-    node = HUIPredNode(parsed_args)
-    try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == "__main__":
+def main(args=None):
     parser = argparse.ArgumentParser(
         description="ROS2 node for HUI-Pred: subscribe to RGB/depth CompressedImage topics, run YOLO pose + interaction prediction.",
     )
-    parser.add_argument("--rgb_topic", "-r", type=str, default="/rgbd/realsense_head_front/color/image_raw/compressed",
+    parser.add_argument("--rgb_topic", "-r", type=str, default="/camera/color/image_raw/compressed",
                         help="Topic for RGB CompressedImage")
-    parser.add_argument("--depth_topic", "-dt", type=str, default="/rgbd/realsense_head_front/aligned_depth_to_color/image_raw/compressedDepth",
-                        help="Topic for depth Image or CompressedImage/compressedDepth (optional; if set, RGB and depth are time-synced)")
-    parser.add_argument("--camera_info_topic", type=str, default="/rgbd/realsense_head_front/color/camera_info",
-                        help="Topic for CameraInfo used to project torso depth into 3D camera coordinates")
+    parser.add_argument("--depth_topic", "-dt", type=str, default=None,
+                        help="Topic for depth CompressedImage (optional; if set, RGB and depth are time-synced)")
     parser.add_argument("--yolo_model_path", "-y", type=str, default="checkpoints/yolo26x-pose.pt",
                         help="Path to YOLO pose model")
     parser.add_argument("--interaction_prediction_checkpoint", "-ip", type=str, default="checkpoints/converted_mb_FineTuned_28_02_26_best_ap",
@@ -1662,5 +1062,18 @@ if __name__ == "__main__":
         default="/huipred/estimation_mode",
         help="ROS topic publishing std_msgs/String to switch estimation mode ('ip_inference', 'depth_based', 'box_based', or 'none_based')",
     )
-    parsed_args, ros_args = parser.parse_known_args()
-    main(parsed_args, ros_args)
+    parsed_args, ros_args = parser.parse_known_args(args)
+
+    rclpy.init(args=ros_args)
+    node = HUIPredNode(parsed_args)
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
