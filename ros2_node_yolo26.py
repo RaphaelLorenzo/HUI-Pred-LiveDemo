@@ -1021,7 +1021,7 @@ def main(args=None):
     parser = argparse.ArgumentParser(
         description="ROS2 node for HUI-Pred: subscribe to RGB/depth CompressedImage topics, run YOLO pose + interaction prediction.",
     )
-    parser.add_argument("--rgb_topic", "-r", type=str, default="/camera/color/image_raw/compressed",
+    parser.add_argument("--rgb_topic", "-r", type=str, default="/rgbd/realsense_head_front/color/image_raw/compressed",
                         help="Topic for RGB CompressedImage")
     parser.add_argument("--depth_topic", "-dt", type=str, default=None,
                         help="Topic for depth CompressedImage (optional; if set, RGB and depth are time-synced)")
