@@ -689,6 +689,7 @@ class Pose3DNode(Node):
             for tid, joints_3d, h36m_conf in skeletons_cam:
                 joints_base = transform_points(camera_to_base, joints_3d)
                 skeletons_base.append((tid, joints_base, h36m_conf))
+                self.get_logger().info(f"Skeleton base: {joints_base}")
         elif camera_to_base is None and skeletons_cam:
             self.get_logger().warning(
                 f"No TF {self._camera_frame_id} -> {self._base_link_frame}; "
