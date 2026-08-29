@@ -685,6 +685,7 @@ class Pose3DNode(Node):
 
         skeletons_base = []
         camera_to_base = self._lookup_camera_to_base(stamp)
+        self.get_logger().info(f"Camera to base: {camera_to_base}")
         if camera_to_base is not None and skeletons_cam:
             self.get_logger().info(f"Camera to base is not None and skeletons_cam is not empty Lets go!")
             for tid, joints_3d, h36m_conf in skeletons_cam:
