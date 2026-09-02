@@ -57,6 +57,7 @@ H36M_LEFT_SHOULDER, H36M_RIGHT_SHOULDER = 11, 14
 H36M_TORSO = 8  # thorax (mid-shoulders)
 COCO_LEFT_SHOULDER, COCO_RIGHT_SHOULDER = 5, 6
 MIN_VALID_KEYPOINTS = 5
+MIN_BOX_HEIGHT_RATIO = 0.5  # ignore detections shorter than this fraction of image height
 TARGET_LIMB_LENGTH_M = 0.50
 MARKER_DIAMETER_M = 0.10
 BONE_LINE_WIDTH_M = 0.03
@@ -105,6 +106,11 @@ def is_valid_coco_detection(scores: np.ndarray, kp_thresh: float) -> bool:
     if scores[COCO_LEFT_SHOULDER] <= kp_thresh or scores[COCO_RIGHT_SHOULDER] <= kp_thresh:
         return False
     return int((scores > kp_thresh).sum()) >= MIN_VALID_KEYPOINTS
+
+
+def is_tall_enough_box(bbox_xyxy: np.ndarray, image_height: float) -> bool:
+    """Keep boxes whose height is at least MIN_BOX_HEIGHT_RATIO of the image height."""
+    return float(bbox_xyxy[3] - bbox_xyxy[1]) >= MIN_BOX_HEIGHT_RATIO * float(image_height)
 
 
 def dim_bgr_color(color: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
@@ -682,6 +688,7 @@ class Pose3DNode(Node):
         box_confs = results.boxes.conf.cpu().numpy()
         keypoints_all = results.keypoints.xy.cpu().numpy()
         scores_all = results.keypoints.conf.cpu().numpy()
+        image_height = float(bgr.shape[0])
 
         # One entry per track id (YOLO can occasionally repeat an id in one frame).
         best_idx_for_tid: dict[int, int] = {}
@@ -692,6 +699,7 @@ class Pose3DNode(Node):
         frame_indices = [
             i for i in best_idx_for_tid.values()
             if is_valid_coco_detection(scores_all[i], self.kp_thresh)
+            and is_tall_enough_box(boxes[i], image_height)
         ]
         track_colors = {int(track_ids[i]): get_track_color(int(track_ids[i])) for i in frame_indices}
 

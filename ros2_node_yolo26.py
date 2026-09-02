@@ -60,6 +60,7 @@ INITIAL_MIN_FRAMES_ENGAGED = 2
 BREAKUP_FRAMES_DISENGAGED = 10
 MIN_EYES_SCALE_THRESHOLD = 0.5
 MAX_EYES_SCALE_THRESHOLD = 0.99
+MIN_BOX_HEIGHT_RATIO = 0.5  # ignore detections shorter than this fraction of image height
 
 IP_MODELS_NAME_TO_INDEX = {
     "converted_mb_FineTuned_28_02_26_best_ap": 0,
@@ -812,92 +813,105 @@ class HUIPredNode(Node):
             keypoints_all = keypoints_all.cpu().numpy()
             scores_all = scores_all.cpu().numpy()
 
-            depths = []
-            if depth_image is not None:
-                for i in range(len(current_track_ids)):
-                    d_raw = estimate_torso_depth(
-                        keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
-                    )
-                    depths.append(d_raw / args.depth_scale if d_raw > 0 else None)
+            keep = (boxes[:, 3] - boxes[:, 1]) >= MIN_BOX_HEIGHT_RATIO * float(image.height)
+            current_track_ids = current_track_ids[keep]
+            boxes = boxes[keep]
+            confs = confs[keep]
+            keypoints_all = keypoints_all[keep]
+            scores_all = scores_all[keep]
+            ip_input_tensor = ip_input_tensor[keep]
+
+            if len(current_track_ids) == 0:
+                current_track_ids = []
+                boxes = confs = keypoints_all = scores_all = []
+                depths = []
             else:
-                depths = [None] * len(current_track_ids)
+                depths = []
+                if depth_image is not None:
+                    for i in range(len(current_track_ids)):
+                        d_raw = estimate_torso_depth(
+                            keypoints_all[i], scores_all[i], depth_image, args.kp_thresh
+                        )
+                        depths.append(d_raw / args.depth_scale if d_raw > 0 else None)
+                else:
+                    depths = [None] * len(current_track_ids)
 
-            for i, tid in enumerate(current_track_ids):
-                tid = int(tid)
-                if tid not in self.track_history:
-                    self.track_history[tid] = {
-                        "detections": [], "poses": [],
-                        "ip_input_tensor": [], "indexes": [], "ip_output": [],
-                        "ip_output_filtered": []
-                    }
-                self.track_history[tid]["detections"].append({
-                    "frame": self.frame_idx,
-                    "bbox": boxes[i].tolist(),
-                    "conf": float(confs[i]),
-                    "depth": depths[i] if depths[i] is not None else None,
-                    # **({"depth": depths[i]} if depths[i] is not None else {}),
-                })
-                self.track_history[tid]["poses"].append({
-                    "frame": self.frame_idx,
-                    "keypoints": keypoints_all[i].tolist(),
-                    "scores": scores_all[i].tolist(),
-                })
-                self.track_history[tid]["ip_input_tensor"].append(ip_input_tensor[i])
-                self.track_history[tid]["indexes"].append(self.frame_idx)
-
-            # -- Interaction prediction --
-            if self.ip_model is not None and self.current_estimation_mode == "ip_inference":
-                t_ip_s = time.perf_counter()
-                cur = {int(t): self.track_history[int(t)] for t in current_track_ids}
-                ip_dict = action_net_inference(
-                    args, self.ip_model, self.ip_config, cur,
-                    device=self._device,
-                    image_size=(image.width, image.height),
-                    backprojection=args.backprojection,
-                )
-                t_ip = time.perf_counter() - t_ip_s
-                for tid, val in ip_dict.items():
-                    self.track_history[tid]["ip_output"].append(val)
-                    history_length = len(self.track_history[tid]["ip_output"])
-                    FILTER_LENGTH = self.filter_length
-                    last_ip_outputs = self.track_history[tid]["ip_output"][-min(FILTER_LENGTH,history_length):]
-                    last_ip_outputs_filtered = []
-                    for v in last_ip_outputs:
-                        if isinstance(v, (int, float, np.floating)):
-                            last_ip_outputs_filtered.append(float(v))
-                        else:
-                            last_ip_outputs_filtered.append(0.0)
-                    print(f"Track {tid}  | last_ip_outputs_filtered: {[f'{v:.2f}' for v in last_ip_outputs_filtered]}")
-                    self.track_history[tid]["ip_output_filtered"].append(float(np.mean(np.array(last_ip_outputs_filtered)))) # mean of last 3 ip outputs
-
-            elif len(depths) > 0 and depths[0] is not None and self.current_estimation_mode == "depth_based":
-                ip_estimation_depth_range = [self.ip_estimation_depth_min, self.ip_estimation_depth_max] # linear mapping between 0 and 1 for IP, using as input depth scaled between min and max depth
                 for i, tid in enumerate(current_track_ids):
-                    track_depth = self.track_history[tid]["detections"][-1]["depth"]
-                    if track_depth is not None and track_depth > 0:
-                        estimated_ip = (ip_estimation_depth_range[1] - track_depth) / (ip_estimation_depth_range[1] - ip_estimation_depth_range[0])
+                    tid = int(tid)
+                    if tid not in self.track_history:
+                        self.track_history[tid] = {
+                            "detections": [], "poses": [],
+                            "ip_input_tensor": [], "indexes": [], "ip_output": [],
+                            "ip_output_filtered": []
+                        }
+                    self.track_history[tid]["detections"].append({
+                        "frame": self.frame_idx,
+                        "bbox": boxes[i].tolist(),
+                        "conf": float(confs[i]),
+                        "depth": depths[i] if depths[i] is not None else None,
+                        # **({"depth": depths[i]} if depths[i] is not None else {}),
+                    })
+                    self.track_history[tid]["poses"].append({
+                        "frame": self.frame_idx,
+                        "keypoints": keypoints_all[i].tolist(),
+                        "scores": scores_all[i].tolist(),
+                    })
+                    self.track_history[tid]["ip_input_tensor"].append(ip_input_tensor[i])
+                    self.track_history[tid]["indexes"].append(self.frame_idx)
+
+                # -- Interaction prediction --
+                if self.ip_model is not None and self.current_estimation_mode == "ip_inference":
+                    t_ip_s = time.perf_counter()
+                    cur = {int(t): self.track_history[int(t)] for t in current_track_ids}
+                    ip_dict = action_net_inference(
+                        args, self.ip_model, self.ip_config, cur,
+                        device=self._device,
+                        image_size=(image.width, image.height),
+                        backprojection=args.backprojection,
+                    )
+                    t_ip = time.perf_counter() - t_ip_s
+                    for tid, val in ip_dict.items():
+                        self.track_history[tid]["ip_output"].append(val)
+                        history_length = len(self.track_history[tid]["ip_output"])
+                        FILTER_LENGTH = self.filter_length
+                        last_ip_outputs = self.track_history[tid]["ip_output"][-min(FILTER_LENGTH,history_length):]
+                        last_ip_outputs_filtered = []
+                        for v in last_ip_outputs:
+                            if isinstance(v, (int, float, np.floating)):
+                                last_ip_outputs_filtered.append(float(v))
+                            else:
+                                last_ip_outputs_filtered.append(0.0)
+                        print(f"Track {tid}  | last_ip_outputs_filtered: {[f'{v:.2f}' for v in last_ip_outputs_filtered]}")
+                        self.track_history[tid]["ip_output_filtered"].append(float(np.mean(np.array(last_ip_outputs_filtered)))) # mean of last 3 ip outputs
+
+                elif len(depths) > 0 and depths[0] is not None and self.current_estimation_mode == "depth_based":
+                    ip_estimation_depth_range = [self.ip_estimation_depth_min, self.ip_estimation_depth_max] # linear mapping between 0 and 1 for IP, using as input depth scaled between min and max depth
+                    for i, tid in enumerate(current_track_ids):
+                        track_depth = self.track_history[tid]["detections"][-1]["depth"]
+                        if track_depth is not None and track_depth > 0:
+                            estimated_ip = (ip_estimation_depth_range[1] - track_depth) / (ip_estimation_depth_range[1] - ip_estimation_depth_range[0])
+                            estimated_ip = max(0, min(1, estimated_ip))
+                            print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from depth {track_depth:.2f}m")
+                            self.track_history[tid]["ip_output"].append(estimated_ip)
+                            self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
+
+                elif self.current_estimation_mode == "box_based":
+                    # ip_estimation_box_range = [self.ip_estimation_box_min, self.ip_estimation_box_max]
+                    image_height = image.height
+                    for i, tid in enumerate(current_track_ids):
+                        box = self.track_history[tid]["detections"][-1]["bbox"]
+                        box_bottom_y = box[3]
+                        box_bottom_relative = (image_height - box_bottom_y) / image_height
+                        # 3m threhsold is 17.5% of the image height, 1.5m is 10% of the image height
+                        estimated_ip = (0.26 - box_bottom_relative) / (0.26 - 0.1)
                         estimated_ip = max(0, min(1, estimated_ip))
-                        print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from depth {track_depth:.2f}m")
+                        # relative_box_height = (box[3] - box[1]) / image_height
+                        # estimated_ip = (relative_box_height - ip_estimation_box_range[0]) / (ip_estimation_box_range[1] - ip_estimation_box_range[0])
+                        # estimated_ip = max(0, min(1, estimated_ip))
+                        # print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box height {relative_box_height:.2f}")
+                        print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box bottom {box_bottom_relative:.2f} (interp 10% to 26% of image height)")
                         self.track_history[tid]["ip_output"].append(estimated_ip)
                         self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
-
-            elif self.current_estimation_mode == "box_based":
-                # ip_estimation_box_range = [self.ip_estimation_box_min, self.ip_estimation_box_max]
-                image_height = image.height
-                for i, tid in enumerate(current_track_ids):
-                    box = self.track_history[tid]["detections"][-1]["bbox"]
-                    box_bottom_y = box[3]
-                    box_bottom_relative = (image_height - box_bottom_y) / image_height
-                    # 3m threhsold is 17.5% of the image height, 1.5m is 10% of the image height
-                    estimated_ip = (0.26 - box_bottom_relative) / (0.26 - 0.1)
-                    estimated_ip = max(0, min(1, estimated_ip))
-                    # relative_box_height = (box[3] - box[1]) / image_height
-                    # estimated_ip = (relative_box_height - ip_estimation_box_range[0]) / (ip_estimation_box_range[1] - ip_estimation_box_range[0])
-                    # estimated_ip = max(0, min(1, estimated_ip))
-                    # print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box height {relative_box_height:.2f}")
-                    print(f"Track {tid}  | estimated_ip: {estimated_ip:.2f} from box bottom {box_bottom_relative:.2f} (interp 10% to 26% of image height)")
-                    self.track_history[tid]["ip_output"].append(estimated_ip)
-                    self.track_history[tid]["ip_output_filtered"].append(estimated_ip)
             
         # -- Build output image and publish --
         h, w = bgr.shape[:2]
